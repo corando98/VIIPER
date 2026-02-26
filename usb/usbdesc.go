@@ -242,9 +242,18 @@ func (d ClassSpecificDescriptor) Bytes() Data {
 type HIDFunction struct {
 	Descriptor HIDDescriptor
 	Report     hid.Report
+	// ReportRaw, if non-nil, overrides Report with pre-encoded descriptor bytes.
+	// Use this when the descriptor is too complex for the structured hid.Report API.
+	ReportRaw []byte
 }
 
 func (f HIDFunction) reportLen() (uint16, error) {
+	if f.ReportRaw != nil {
+		if len(f.ReportRaw) > 0xFFFF {
+			return 0, fmt.Errorf("usb: HID report descriptor too large: %d", len(f.ReportRaw))
+		}
+		return uint16(len(f.ReportRaw)), nil
+	}
 	rb, err := f.Report.Bytes()
 	if err != nil {
 		return 0, err
@@ -270,6 +279,9 @@ func (f HIDFunction) DescriptorBytes() (Data, error) {
 
 // ReportBytes returns the HID report descriptor (0x22) bytes.
 func (f HIDFunction) ReportBytes() (Data, error) {
+	if f.ReportRaw != nil {
+		return Data(f.ReportRaw), nil
+	}
 	rb, err := f.Report.Bytes()
 	if err != nil {
 		return nil, err
