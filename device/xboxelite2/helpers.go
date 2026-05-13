@@ -5,9 +5,31 @@ func stickI16ToU16(v int16) uint16 {
 	return uint16(int32(v) + 32768)
 }
 
+// invertStickY flips vertical stick direction while preserving full int16 range.
+func invertStickY(v int16) int16 {
+	if v == -32768 {
+		return 32767
+	}
+	return -v
+}
+
 // triggerU8ToU10 scales trigger range 0..255 to 0..1023.
 func triggerU8ToU10(v uint8) uint16 {
-	return (uint16(v)*1023 + 127) / 255
+	return uint16((uint32(v)*1023 + 127) / 255)
+}
+
+// triggerU8ToU16 scales trigger range 0..255 to 0..65535.
+func triggerU8ToU16(v uint8) uint16 {
+	return uint16((uint32(v)*65535 + 127) / 255)
+}
+
+// rumblePercentToU8 converts 0..100 force-feedback magnitudes to 0..255.
+// Values above 100 are passed through to handle non-standard stacks.
+func rumblePercentToU8(v uint8) uint8 {
+	if v > 100 {
+		return v
+	}
+	return uint8((uint16(v)*255 + 50) / 100)
 }
 
 // dpadBitmaskToHat converts DPad bitmask into HID hat values:

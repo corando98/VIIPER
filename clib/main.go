@@ -25,6 +25,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -34,10 +36,14 @@ import (
 	_ "github.com/Alia5/VIIPER/internal/registry"
 
 	"github.com/Alia5/VIIPER/device"
-	"github.com/Alia5/VIIPER/device/dualshock4"
 	"github.com/Alia5/VIIPER/device/dualsenseedge"
+	"github.com/Alia5/VIIPER/device/dualshock4"
+	"github.com/Alia5/VIIPER/device/steamcontroller"
+	"github.com/Alia5/VIIPER/device/switchpro"
 	"github.com/Alia5/VIIPER/device/xbox360"
 	"github.com/Alia5/VIIPER/device/xboxelite2"
+	"github.com/Alia5/VIIPER/device/xboxgip"
+	elite2state "github.com/Alia5/VIIPER/internal/inputstate/elite2"
 	"github.com/Alia5/VIIPER/internal/server/api"
 	usbsrv "github.com/Alia5/VIIPER/internal/server/usb"
 	"github.com/Alia5/VIIPER/usb"
@@ -68,7 +74,7 @@ type deviceKey struct {
 
 type deviceInfo struct {
 	dev      usb.Device
-	typeName string // resolved registry name, e.g. "xbox360", "dualshock4", "dualsenseedge", "xboxelite2"
+	typeName string // resolved registry name, e.g. "xbox360", "dualshock4", "dualsenseedge", "xboxelite2", "steamcontroller"
 }
 
 // deviceTypeAliases maps user-friendly names to their registry type + profile.
@@ -77,9 +83,14 @@ var deviceTypeAliases = map[string]struct {
 	registryName string
 	profile      string
 }{
-	"steamdeck-generic": {registryName: "xboxelite2", profile: "steamdeck-generic"},
-	"steam-generic":     {registryName: "xboxelite2", profile: "steamdeck-generic"},
-	"steam-controller":  {registryName: "xboxelite2", profile: "steamdeck-generic"},
+	"steamdeck":         {registryName: "steamcontroller", profile: "steamdeck"},
+	"steamdeck-generic": {registryName: "steamcontroller", profile: "steamdeck-generic"},
+	"steam-generic":     {registryName: "steamcontroller", profile: "steamdeck-generic"},
+	"steam-controller":  {registryName: "steamcontroller", profile: "steamdeck-generic"},
+	"xbox-one":          {registryName: "xboxelite2", profile: "xbox-one"},
+	"xbox-elite":        {registryName: "xboxelite2", profile: "xbox-one-elite"},
+	"joycon-left":       {registryName: "switchpro", profile: "joycon-left"},
+	"joycon-right":      {registryName: "switchpro", profile: "joycon-right"},
 }
 
 // hiddenDeviceTypes are device types from the registry that should not appear
@@ -87,6 +98,7 @@ var deviceTypeAliases = map[string]struct {
 var hiddenDeviceTypes = map[string]bool{
 	"keyboard": true,
 	"mouse":    true,
+	"xboxgip":  true,
 }
 
 type feedbackReg struct {
@@ -145,6 +157,14 @@ func viiper_init(listenAddr *C.char) C.int {
 		addr = "0.0.0.0:3241"
 	}
 
+	// Set up file-based logging next to the DLL for protocol debugging.
+	if exe, err := os.Executable(); err == nil {
+		logPath := filepath.Join(filepath.Dir(exe), "viiper_go_debug.log")
+		if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+			handler := slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelInfo})
+			slog.SetDefault(slog.New(handler))
+		}
+	}
 	logger := slog.Default()
 
 	cfg := usbsrv.ServerConfig{
@@ -258,7 +278,7 @@ func viiper_device_add(busID C.uint32_t, typeName *C.char, outDeviceID *C.uint32
 	bid := uint32(busID)
 	tn := strings.ToLower(C.GoString(typeName))
 
-	// Resolve aliases (e.g. "steamdeck" -> "xboxelite2" with profile).
+	// Resolve aliases (e.g. "steamdeck" -> "steamcontroller" with profile).
 	registryName := tn
 	var opts device.CreateOptions
 	if alias, ok := deviceTypeAliases[tn]; ok {
@@ -583,11 +603,73 @@ func viiper_device_set_input(busID C.uint32_t, deviceID C.uint32_t, data *C.uint
 		if !ok {
 			return setError(fmt.Errorf("device type mismatch"))
 		}
-		var state xboxelite2.InputState
-		if err := state.UnmarshalBinary(buf); err != nil {
+		var state elite2state.InputState
+		var err error
+		switch len(buf) {
+		case elite2state.InputStateSize:
+			err = state.UnmarshalBinary(buf)
+		case elite2state.InputStateV1Size:
+			err = state.UnmarshalV1Binary(buf)
+		case elite2state.LegacyInputStateSize:
+			err = state.UnmarshalLegacyBinary(buf)
+		default:
+			err = fmt.Errorf(
+				"invalid xboxelite2 input size: got %d (expected %d, %d, or %d)",
+				len(buf), elite2state.InputStateSize, elite2state.InputStateV1Size, elite2state.LegacyInputStateSize,
+			)
+		}
+		if err != nil {
 			return setError(err)
 		}
 		xe2.UpdateInputState(&state)
+
+	case "steamcontroller":
+		sc, ok := info.dev.(*steamcontroller.SteamController)
+		if !ok {
+			return setError(fmt.Errorf("device type mismatch"))
+		}
+		// Steam controller reuses the shared Elite-2 wire format.
+		var state elite2state.InputState
+		var err error
+		switch len(buf) {
+		case elite2state.InputStateSize:
+			err = state.UnmarshalBinary(buf)
+		case elite2state.InputStateV1Size:
+			err = state.UnmarshalV1Binary(buf)
+		case elite2state.LegacyInputStateSize:
+			err = state.UnmarshalLegacyBinary(buf)
+		default:
+			err = fmt.Errorf(
+				"invalid steamcontroller input size: got %d (expected %d, %d, or %d)",
+				len(buf), elite2state.InputStateSize, elite2state.InputStateV1Size, elite2state.LegacyInputStateSize,
+			)
+		}
+		if err != nil {
+			return setError(err)
+		}
+		sc.UpdateInputState(&state)
+
+	case "switchpro":
+		sp, ok := info.dev.(*switchpro.SwitchPro)
+		if !ok {
+			return setError(fmt.Errorf("device type mismatch"))
+		}
+		var state switchpro.InputState
+		if err := state.UnmarshalBinary(buf); err != nil {
+			return setError(err)
+		}
+		sp.UpdateInputState(&state)
+
+	case "xboxgip":
+		xdev, ok := info.dev.(*xboxgip.XboxGIP)
+		if !ok {
+			return setError(fmt.Errorf("device type mismatch"))
+		}
+		var state xboxgip.InputState
+		if err := state.UnmarshalBinary(buf); err != nil {
+			return setError(err)
+		}
+		xdev.UpdateInputState(&state)
 
 	default:
 		return setError(fmt.Errorf("input not supported for device type: %s", info.typeName))
@@ -666,7 +748,48 @@ func viiper_device_set_feedback_callback(busID C.uint32_t, deviceID C.uint32_t, 
 		if !ok {
 			return setError(fmt.Errorf("device type mismatch"))
 		}
-		xe2.SetOutputCallback(func(output xboxelite2.OutputState) {
+		xe2.SetOutputCallback(func(output elite2state.OutputState) {
+			data, err := output.MarshalBinary()
+			if err != nil {
+				return
+			}
+			invokeFeedbackCallback(bid, did, data)
+		})
+
+	case "steamcontroller":
+		sc, ok := info.dev.(*steamcontroller.SteamController)
+		if !ok {
+			return setError(fmt.Errorf("device type mismatch"))
+		}
+		// Steam controller shares OutputState with xboxelite2 via the
+		// neutral elite2 wire-format package.
+		sc.SetOutputCallback(func(output elite2state.OutputState) {
+			data, err := output.MarshalBinary()
+			if err != nil {
+				return
+			}
+			invokeFeedbackCallback(bid, did, data)
+		})
+
+	case "switchpro":
+		sp, ok := info.dev.(*switchpro.SwitchPro)
+		if !ok {
+			return setError(fmt.Errorf("device type mismatch"))
+		}
+		sp.SetOutputCallback(func(output switchpro.OutputState) {
+			data, err := output.MarshalBinary()
+			if err != nil {
+				return
+			}
+			invokeFeedbackCallback(bid, did, data)
+		})
+
+	case "xboxgip":
+		xdev, ok := info.dev.(*xboxgip.XboxGIP)
+		if !ok {
+			return setError(fmt.Errorf("device type mismatch"))
+		}
+		xdev.SetOutputCallback(func(output xboxgip.OutputState) {
 			data, err := output.MarshalBinary()
 			if err != nil {
 				return

@@ -1,4 +1,15 @@
-package xboxelite2
+// Package elite2 defines the wire format shared by VIIPER device backends
+// whose host-facing reports diverge but whose client-to-server input stream
+// is identical. The format derives from the Xbox Elite 2 BLE shape (buttons,
+// sticks, triggers, dpad, IMU) and was later extended with Steam touchpad
+// fields. Both the xboxelite2 and steamcontroller device packages consume
+// this same byte layout — Xbox profiles ignore the touchpad/IMU tail, Steam
+// profiles pack it into the Steam Deck vendor report.
+//
+// This package is deliberately neutral: it does not depend on any device
+// package, so neither xboxelite2 nor steamcontroller appears to "own" the
+// wire format.
+package elite2
 
 import (
 	"encoding/binary"

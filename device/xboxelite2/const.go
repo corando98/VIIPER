@@ -4,22 +4,22 @@ import "github.com/Alia5/VIIPER/usb"
 
 const (
 	DefaultVID uint16 = 0x045E // Microsoft
-	DefaultVIDSteam uint16 = 0x28DE // Valve
-	// Keep the default PID on a non-GIP value so Windows binds to HID instead of xboxgip.sys.
-	DefaultPID uint16 = 0x0B02
 
-	DefaultPIDElite2 uint16 = DefaultPID
-	DefaultPIDElite2GIP uint16 = 0x0B00
-	DefaultPIDXboxOneElite uint16 = 0x02E3
-	DefaultPIDXboxSeries uint16 = 0x0B12
-	DefaultPIDSteamDeck uint16 = 0x1205
-	DefaultPIDSteamGeneric uint16 = 0x12F0
-	DefaultPIDSteamMsiClaw uint16 = 0x12FA
-	DefaultPIDSteamLenovoLegionGo2 uint16 = 0x12FB
-	DefaultPIDSteamZotacZone uint16 = 0x12FC
-	DefaultPIDSteamAsusRogAlly uint16 = 0x12FD
-	DefaultPIDSteamLenovoLegionGo uint16 = 0x12FE
-	DefaultPIDSteamLenovoLegionGoS uint16 = 0x12FF
+	// Xbox Wireless Controller Model 1914 (BLE PID 0x0B13). Windows binds
+	// its generic HID driver to this PID and respects the report descriptor,
+	// so our 17-byte report parses correctly. Other Xbox PIDs (0x0B05 Elite
+	// Series 2 BLE, 0x0B00 wired GIP) trigger Microsoft-specific drivers
+	// (dc1-controller.inf / xboxgip) that impose hardcoded byte layouts our
+	// descriptor doesn't match — those PIDs left the device unusable in
+	// testing, so we ship the working PID instead. SDL will identify the
+	// device as "Xbox Series X Controller" / "Xbox Wireless Controller".
+	DefaultPID uint16 = 0x0B13
+
+	DefaultPIDElite2       uint16 = DefaultPID
+	DefaultPIDElite2GIP    uint16 = 0x0B00
+	DefaultPIDXboxOneElite uint16 = 0x02E3 // wired Elite 1 (Model 1698)
+	DefaultPIDXboxSeries   uint16 = DefaultPID
+	DefaultPIDXboxOne      uint16 = 0x02FD // Xbox One S BLE
 )
 
 const (
@@ -28,27 +28,27 @@ const (
 )
 
 const (
-	ReportIDInput  = 0x01
-	ReportIDOutput = 0x02
-)
-
-const (
-	SteamDeckInputMajorVersion = 0x01
-	SteamDeckInputMinorVersion = 0x00
-	SteamDeckInputReportType   = 0x09
-	SteamDeckRumbleCommandType = 0xEB
+	ReportIDInput          = 0x01
+	ReportIDOutput         = 0x02
+	ReportIDOutputRumbleFF = 0x03
 )
 
 const (
 	// 1 byte report ID + 16 bytes payload:
-	// 4x16-bit sticks + 2x10-bit triggers + hat + 17 buttons + padding.
+	// 6x16-bit axes + hat + buttons + padding.
 	InputReportSize = 17
-	// Steam Deck input report is a 64-byte vendor report.
-	InputReportSizeSteamDeck = 64
 	// 1 byte report ID + 4 bytes rumble payload.
 	OutputReportSize = 5
-	// Steam Deck rumble command reports are 64 bytes.
-	OutputReportSizeSteamDeck = 64
+	// 1 byte report ID + 8 bytes force-feedback payload (Xbox BLE-style ff_report).
+	OutputReportSizeRumbleFF = 9
+)
+
+// Xbox BLE force-feedback motor mask bits (ff_data.enable).
+const (
+	RumbleMaskWeak         uint8 = 0x01
+	RumbleMaskStrong       uint8 = 0x02
+	RumbleMaskTriggerRight uint8 = 0x04
+	RumbleMaskTriggerLeft  uint8 = 0x08
 )
 
 // Button constants for the wire protocol (u16 bitmask, XInput-compatible order).
@@ -104,151 +104,196 @@ const DPadMask uint8 = 0x0F
 const (
 	ProfileElite2       = "elite2"
 	ProfileElite2GIP    = "elite2-gip"
+	ProfileXboxOne      = "xbox-one"
 	ProfileXboxOneElite = "xbox-one-elite"
 	ProfileXboxSeries   = "xbox-series"
-	ProfileSteamDeck    = "steamdeck"
-	ProfileSteamGeneric = "steamdeck-generic"
 )
 
-// Xbox HID descriptor builder:
-// report payload is always 16 bytes (17 including report ID), while the exposed button
-// count changes by profile to alter host-visible capability shape.
-func makeXboxHIDDescriptor(buttonCount uint8) []byte {
-	if buttonCount == 0 || buttonCount > 24 {
-		buttonCount = 17
-	}
-	paddingCount := uint8(24 - buttonCount)
-
+// xboxBLEHIDDescriptor is based on the real Xbox Wireless Controller BLE
+// (Model 1914 / PID 0x0B13). Triggers widened from 10-bit to 16-bit
+// for Windows HID parser compatibility.
+//
+// Input report 0x01 layout (17 bytes):
+//   b[0]    = Report ID (0x01)
+//   b[1:3]  = Left Stick X  (uint16 LE, Usage X 0x30, 0-65535, center 32768)
+//   b[3:5]  = Left Stick Y  (uint16 LE, Usage Y 0x31, 0-65535, center 32768)
+//   b[5:7]  = Right Stick X (uint16 LE, Usage Rx 0x33, 0-65535, center 32768)
+//   b[7:9]  = Right Stick Y (uint16 LE, Usage Ry 0x34, 0-65535, center 32768)
+//   b[9:11] = Left Trigger   (uint16 LE, Usage Z 0x32, 0-65535)
+//   b[11:13]= Right Trigger  (uint16 LE, Usage Rz 0x35, 0-65535)
+//   b[13]   = Hat Switch      (4-bit, 0=center/1-8=dirs, +4 pad)
+//   b[14:16]= Buttons 1-12   (12 bits: A,B,X,Y,LB,RB,View,Menu,LS,RS,Guide,unused +4 pad)
+//   b[16]   = Share/Record    (1 bit Consumer 0x0C:0xB2, +7 pad)
+//
+// FF output report 0x03: PID page Set Effect Report (8 bytes payload).
+var xboxBLEHIDDescriptor = func() []byte {
 	return []byte{
+		// --- Application Collection (Game Pad) ---
 		0x05, 0x01, // Usage Page (Generic Desktop)
 		0x09, 0x05, // Usage (Game Pad)
 		0xA1, 0x01, // Collection (Application)
+		0x85, 0x01, // Report ID (0x01)
 
-		// Input report ID 0x01.
-		0x85, 0x01, // Report ID (1)
-
-		// Sticks: X, Y, Z, Rz as 16-bit unsigned.
-		0x09, 0x30, // Usage (X)
-		0x09, 0x31, // Usage (Y)
-		0x09, 0x32, // Usage (Z)
-		0x09, 0x35, // Usage (Rz)
+		// --- Left stick (X, Y) — one Input each so SDL's parser binds
+		//     each usage to its own field unambiguously.
 		0x15, 0x00, // Logical Minimum (0)
 		0x27, 0xFF, 0xFF, 0x00, 0x00, // Logical Maximum (65535)
 		0x75, 0x10, // Report Size (16)
-		0x95, 0x04, // Report Count (4)
-		0x81, 0x02, // Input (Data,Var,Abs)
+		0x95, 0x01, // Report Count (1)
+		0x09, 0x30, // Usage (X)
+		0x81, 0x02, // Input (Data,Var,Abs) → bytes 1-2 = LX
+		0x09, 0x31, // Usage (Y)
+		0x81, 0x02, // Input → bytes 3-4 = LY
 
-		// Triggers: LT/RT as 10-bit values (0..1023), each padded to 16 bits.
-		0x05, 0x02, // Usage Page (Simulation Controls)
-		0x09, 0xC5, // Usage (Brake)      - LT
+		// --- Right stick (Rx, Ry) — separate Input items per axis. ---
+		0x09, 0x33, // Usage (Rx)
+		0x81, 0x02, // Input → bytes 5-6 = RX
+		0x09, 0x34, // Usage (Ry)
+		0x81, 0x02, // Input → bytes 7-8 = RY
+
+		// --- Left Trigger (Z) — 10-bit field + 6-bit pad.
+		// SDL's HIDAPI Xbox handler keys on bit_size (not Logical Max):
+		// 10-bit Z → LEFT_TRIGGER, 16-bit Z → alt RIGHT-STICK X.
+		// Our packer writes 0..1023 little-endian into bytes 9-10, so
+		// the low 10 bits hold the value and bits 10-15 stay 0 (the pad).
+		0x09, 0x32, // Usage (Z)
 		0x15, 0x00, // Logical Minimum (0)
 		0x26, 0xFF, 0x03, // Logical Maximum (1023)
 		0x75, 0x0A, // Report Size (10)
 		0x95, 0x01, // Report Count (1)
 		0x81, 0x02, // Input (Data,Var,Abs)
+		0x15, 0x00, // Logical Minimum (0)
+		0x25, 0x00, // Logical Maximum (0)
 		0x75, 0x06, // Report Size (6)
 		0x95, 0x01, // Report Count (1)
-		0x81, 0x03, // Input (Const,Var,Abs)
+		0x81, 0x03, // Input (Cnst,Var,Abs) — 6-bit pad to byte-align
 
-		0x09, 0xC4, // Usage (Accelerator) - RT
+		// --- Right Trigger (Rz) — 10-bit field + 6-bit pad. ---
+		0x09, 0x35, // Usage (Rz)
 		0x15, 0x00, // Logical Minimum (0)
 		0x26, 0xFF, 0x03, // Logical Maximum (1023)
 		0x75, 0x0A, // Report Size (10)
 		0x95, 0x01, // Report Count (1)
 		0x81, 0x02, // Input (Data,Var,Abs)
+		0x15, 0x00, // Logical Minimum (0)
+		0x25, 0x00, // Logical Maximum (0)
 		0x75, 0x06, // Report Size (6)
 		0x95, 0x01, // Report Count (1)
-		0x81, 0x03, // Input (Const,Var,Abs)
+		0x81, 0x03, // Input (Cnst,Var,Abs) — 6-bit pad to byte-align
 
-		// Hat switch (DPad): 0 = neutral, 1..8 = directions.
+		// --- Hat Switch (4-bit + 4-bit padding) ---
 		0x05, 0x01, // Usage Page (Generic Desktop)
 		0x09, 0x39, // Usage (Hat switch)
-		0x15, 0x00, // Logical Minimum (0)
+		0x15, 0x01, // Logical Minimum (1)
 		0x25, 0x08, // Logical Maximum (8)
 		0x35, 0x00, // Physical Minimum (0)
 		0x46, 0x3B, 0x01, // Physical Maximum (315)
-		0x65, 0x14, // Unit (Eng Rotation)
+		0x66, 0x14, 0x00, // Unit (Eng Rotation: Degrees)
 		0x75, 0x04, // Report Size (4)
 		0x95, 0x01, // Report Count (1)
 		0x81, 0x42, // Input (Data,Var,Abs,Null)
 		0x75, 0x04, // Report Size (4)
 		0x95, 0x01, // Report Count (1)
-		0x81, 0x03, // Input (Const,Var,Abs)
+		0x15, 0x00, // Logical Minimum (0)
+		0x25, 0x00, // Logical Maximum (0)
+		0x35, 0x00, // Physical Minimum (0)
+		0x45, 0x00, // Physical Maximum (0)
+		0x65, 0x00, // Unit (None)
+		0x81, 0x03, // Input (Cnst,Var,Abs) — 4-bit padding
 
-		// Profile-specific button count.
+		// --- Buttons 1-12 (12 bits + 4-bit padding) ---
 		0x05, 0x09, // Usage Page (Button)
-		0x19, 0x01, // Usage Minimum (1)
-		0x29, buttonCount, // Usage Maximum
+		0x19, 0x01, // Usage Minimum (Button 1)
+		0x29, 0x0C, // Usage Maximum (Button 12)
 		0x15, 0x00, // Logical Minimum (0)
 		0x25, 0x01, // Logical Maximum (1)
 		0x75, 0x01, // Report Size (1)
-		0x95, buttonCount, // Report Count (buttons)
+		0x95, 0x0C, // Report Count (12)
 		0x81, 0x02, // Input (Data,Var,Abs)
-		0x75, 0x01, // Report Size (1)
-		0x95, paddingCount, // Report Count (padding)
-		0x81, 0x03, // Input (Const,Var,Abs)
-
-		// Output report ID 0x02 (rumble).
-		0x85, 0x02, // Report ID (2)
-		0x06, 0x00, 0xFF, // Usage Page (Vendor Defined)
-		0x09, 0x01, // Usage (Vendor Usage 1)
 		0x15, 0x00, // Logical Minimum (0)
-		0x26, 0xFF, 0x00, // Logical Maximum (255)
+		0x25, 0x00, // Logical Maximum (0)
+		0x75, 0x01, // Report Size (1)
+		0x95, 0x04, // Report Count (4)
+		0x81, 0x03, // Input (Cnst,Var,Abs) — 4-bit padding
+
+		// --- Share/Record (Consumer Control, 1 bit + 7-bit padding) ---
+		0x05, 0x0C, // Usage Page (Consumer)
+		0x0A, 0xB2, 0x00, // Usage (Record)
+		0x15, 0x00, // Logical Minimum (0)
+		0x25, 0x01, // Logical Maximum (1)
+		0x95, 0x01, // Report Count (1)
+		0x75, 0x01, // Report Size (1)
+		0x81, 0x02, // Input (Data,Var,Abs)
+		0x15, 0x00, // Logical Minimum (0)
+		0x25, 0x00, // Logical Maximum (0)
+		0x75, 0x07, // Report Size (7)
+		0x95, 0x01, // Report Count (1)
+		0x81, 0x03, // Input (Cnst,Var,Abs) — 7-bit padding
+
+		// --- Force Feedback Output (Report 0x03, PID page) ---
+		0x05, 0x0F, // Usage Page (PID)
+		0x09, 0x21, // Usage (Set Effect Report)
+		0x85, 0x03, // Report ID (0x03)
+		0xA1, 0x02, // Collection (Logical)
+		0x09, 0x97, // Usage (DC Enable Actuators)
+		0x15, 0x00, // Logical Minimum (0)
+		0x25, 0x01, // Logical Maximum (1)
+		0x75, 0x04, // Report Size (4)
+		0x95, 0x01, // Report Count (1)
+		0x91, 0x02, // Output (Data,Var,Abs)
+		0x15, 0x00, // Logical Minimum (0)
+		0x25, 0x00, // Logical Maximum (0)
+		0x75, 0x04, // Report Size (4)
+		0x95, 0x01, // Report Count (1)
+		0x91, 0x03, // Output (Cnst,Var,Abs) — 4-bit padding
+		0x09, 0x70, // Usage (Magnitude)
+		0x15, 0x00, // Logical Minimum (0)
+		0x25, 0x64, // Logical Maximum (100)
 		0x75, 0x08, // Report Size (8)
 		0x95, 0x04, // Report Count (4)
 		0x91, 0x02, // Output (Data,Var,Abs)
-
-		// Feature report ID 0x03 (firmware info placeholder).
-		0x85, 0x03, // Report ID (3)
-		0x06, 0x00, 0xFF, // Usage Page (Vendor Defined)
-		0x09, 0x02, // Usage (Vendor Usage 2)
+		0x09, 0x50, // Usage (Duration)
+		0x66, 0x01, 0x10, // Unit (SI Lin: Time)
+		0x55, 0x0E, // Unit Exponent (-2)
+		0x15, 0x00, // Logical Minimum (0)
+		0x26, 0xFF, 0x00, // Logical Maximum (255)
 		0x75, 0x08, // Report Size (8)
-		0x95, 0x04, // Report Count (4)
-		0xB1, 0x02, // Feature (Data,Var,Abs)
-
-		0xC0, // End Collection
+		0x95, 0x01, // Report Count (1)
+		0x91, 0x02, // Output (Data,Var,Abs)
+		0x09, 0xA7, // Usage (Start Delay)
+		0x15, 0x00, // Logical Minimum (0)
+		0x26, 0xFF, 0x00, // Logical Maximum (255)
+		0x75, 0x08, // Report Size (8)
+		0x95, 0x01, // Report Count (1)
+		0x91, 0x02, // Output (Data,Var,Abs)
+		0x65, 0x00, // Unit (None)
+		0x55, 0x00, // Unit Exponent (0)
+		0x09, 0x7C, // Usage (Loop Count)
+		0x15, 0x00, // Logical Minimum (0)
+		0x26, 0xFF, 0x00, // Logical Maximum (255)
+		0x75, 0x08, // Report Size (8)
+		0x95, 0x01, // Report Count (1)
+		0x91, 0x02, // Output (Data,Var,Abs)
+		0xC0, // End Collection (Logical)
+		0xC0, // End Collection (Application)
 	}
-}
-
-var xboxElite2HIDDescriptor = makeXboxHIDDescriptor(17)
-var xboxOneEliteHIDDescriptor = makeXboxHIDDescriptor(15)
-var xboxSeriesHIDDescriptor = makeXboxHIDDescriptor(12)
-
-// Vendor-defined Steam Deck controller descriptor (mirrors InputPlumber/HID captures).
-var steamDeckControllerHIDDescriptor = []byte{
-	0x06, 0xff, 0xff, // Usage Page (Vendor Usage Page 0xffff)
-	0x09, 0x01, // Usage (Vendor Usage 0x01)
-	0xa1, 0x01, // Collection (Application)
-	0x09, 0x02, //  Usage (Vendor Usage 0x02)
-	0x09, 0x03, //  Usage (Vendor Usage 0x03)
-	0x15, 0x00, //  Logical Minimum (0)
-	0x26, 0xff, 0x00, //  Logical Maximum (255)
-	0x75, 0x08, //  Report Size (8)
-	0x95, 0x40, //  Report Count (64)
-	0x81, 0x02, //  Input (Data,Var,Abs)
-	0x09, 0x06, //  Usage (Vendor Usage 0x06)
-	0x09, 0x07, //  Usage (Vendor Usage 0x07)
-	0x15, 0x00, //  Logical Minimum (0)
-	0x26, 0xff, 0x00, //  Logical Maximum (255)
-	0x75, 0x08, //  Report Size (8)
-	0x95, 0x40, //  Report Count (64)
-	0xb1, 0x02, //  Feature (Data,Var,Abs)
-	0xc0, // End Collection
-}
+}()
 
 var defaultDescriptor = usb.Descriptor{
 	Device: usb.DeviceDescriptor{
-		BcdUSB:             0x0200,
-		BDeviceClass:       0x00,
-		BDeviceSubClass:    0x00,
-		BDeviceProtocol:    0x00,
-		BMaxPacketSize0:    0x40,
-		IDVendor:           DefaultVID,
-		IDProduct:          DefaultPID,
-		BcdDevice:          0x0100,
-		IManufacturer:      0x01,
-		IProduct:           0x02,
-		ISerialNumber:      0x00,
+		BcdUSB:          0x0200,
+		BDeviceClass:    0x00,
+		BDeviceSubClass: 0x00,
+		BDeviceProtocol: 0x00,
+		BMaxPacketSize0: 0x40,
+		IDVendor:        DefaultVID,
+		IDProduct:       DefaultPID,
+		// Bump revision so Windows refreshes cached HID capabilities after descriptor changes.
+		BcdDevice:     0x0511,
+		IManufacturer: 0x01,
+		IProduct:      0x02,
+		// Provide a stable serial index to help force clean re-enumeration.
+		ISerialNumber:      0x03,
 		BNumConfigurations: 0x01,
 		Speed:              2, // Full speed
 	},
@@ -271,7 +316,7 @@ var defaultDescriptor = usb.Descriptor{
 						{Type: usb.ReportDescType},
 					},
 				},
-				ReportRaw: xboxElite2HIDDescriptor,
+				ReportRaw: xboxBLEHIDDescriptor,
 			},
 			Endpoints: []usb.EndpointDescriptor{
 				{
@@ -292,6 +337,7 @@ var defaultDescriptor = usb.Descriptor{
 	Strings: map[uint8]string{
 		0: "\x04\x09",
 		1: "Microsoft",
-		2: "Xbox Elite Wireless Controller Series 2",
+		2: "Xbox Wireless Controller",
+		3: "VIIPER-XBOX-1914-01",
 	},
 }

@@ -140,7 +140,7 @@ const (
 
 	// USB configuration values
 	usbConfigValueDefault   = 1
-	usbConfigAttrBusPowered = 0x80
+	usbConfigAttrBusPowered = 0xA0 // Bus-powered + remote wakeup (MS-GIPUSB §2.2.3)
 	usbConfigMaxPower100mA  = 50 // In units of 2mA
 
 	// URB header field offsets
@@ -659,6 +659,18 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
 
 		respData := s.processSubmit(dev, ep, dir, setup, outPayload)
 
+		// STALL (EPIPE) when GET_DESCRIPTOR returns no data — required by USB spec
+		// for unsupported descriptor types (e.g. device_qualifier for full-speed devices).
+		// MS-GIPUSB §2.2.2: GIP devices MUST STALL device_qualifier requests.
+		var urbStatus int32
+		if ep == 0 && len(respData) == 0 && len(setup) == 8 {
+			bm := setup[0]
+			breq := setup[1]
+			if (bm == 0x80 || bm == 0x81) && breq == usbReqGetDescriptor {
+				urbStatus = -32 // -EPIPE = STALL
+			}
+		}
+
 		actualLen := uint32(len(respData))
 		if dir == usbip.DirOut {
 			actualLen = uint32(len(outPayload))
@@ -666,7 +678,7 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
 
 		ret := usbip.RetSubmit{
 			Basic:           usbip.HeaderBasic{Command: usbip.RetSubmitCode, Seqnum: seq, Devid: 0, Dir: 0, Ep: 0},
-			Status:          0,
+			Status:          urbStatus,
 			ActualLength:    actualLen,
 			StartFrame:      0,
 			NumberOfPackets: 0,

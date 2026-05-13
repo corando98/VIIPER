@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Alia5/VIIPER/device"
+	elite2state "github.com/Alia5/VIIPER/internal/inputstate/elite2"
 )
 
 func TestBuildUSBInputReport_PaddleOrdering(t *testing.T) {
@@ -27,7 +28,35 @@ func TestBuildUSBInputReport_PaddleOrdering(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			report := dev.buildUSBInputReport(InputState{Buttons: tc.buttons})
+			report := dev.buildUSBInputReport(elite2state.InputState{Buttons: tc.buttons})
+			bits := buttonBits(report)
+			if bits != (1 << tc.wantBit) {
+				t.Fatalf("unexpected button bits: got 0x%06X want 0x%06X", bits, 1<<tc.wantBit)
+			}
+		})
+	}
+}
+
+func TestBuildUSBInputReport_ButtonOrder(t *testing.T) {
+	dev, err := New(nil)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+
+	// Real Xbox BLE button order: Btn9=LThumb(bit8), Btn10=RThumb(bit9), Btn11=Guide(bit10).
+	cases := []struct {
+		name    string
+		buttons uint16
+		wantBit uint32
+	}{
+		{name: "LThumb", buttons: ButtonLThumb, wantBit: 8},
+		{name: "RThumb", buttons: ButtonRThumb, wantBit: 9},
+		{name: "Guide", buttons: ButtonGuide, wantBit: 10},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			report := dev.buildUSBInputReport(elite2state.InputState{Buttons: tc.buttons})
 			bits := buttonBits(report)
 			if bits != (1 << tc.wantBit) {
 				t.Fatalf("unexpected button bits: got 0x%06X want 0x%06X", bits, 1<<tc.wantBit)
@@ -42,7 +71,7 @@ func TestBuildUSBInputReport_AxesAndTriggers(t *testing.T) {
 		t.Fatalf("New returned error: %v", err)
 	}
 
-	state := InputState{
+	state := elite2state.InputState{
 		LX: -32768,
 		LY: 0,
 		RX: 32767,
@@ -61,15 +90,33 @@ func TestBuildUSBInputReport_AxesAndTriggers(t *testing.T) {
 	if got := binary.LittleEndian.Uint16(report[5:7]); got != 65535 {
 		t.Fatalf("RX mismatch: got %d want 65535", got)
 	}
-	if got := binary.LittleEndian.Uint16(report[7:9]); got != 32767 {
-		t.Fatalf("RY mismatch: got %d want 32767", got)
+	if got := binary.LittleEndian.Uint16(report[7:9]); got != 32769 {
+		t.Fatalf("RY mismatch: got %d want 32769", got)
 	}
-
 	if got := binary.LittleEndian.Uint16(report[9:11]); got != triggerU8ToU10(state.LT) {
 		t.Fatalf("LT mismatch: got %d want %d", got, triggerU8ToU10(state.LT))
 	}
 	if got := binary.LittleEndian.Uint16(report[11:13]); got != triggerU8ToU10(state.RT) {
 		t.Fatalf("RT mismatch: got %d want %d", got, triggerU8ToU10(state.RT))
+	}
+}
+
+func TestBuildUSBInputReport_InvertsVerticalAxes(t *testing.T) {
+	dev, err := New(nil)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+
+	report := dev.buildUSBInputReport(elite2state.InputState{
+		LY: 1000,  // up on XInput-style sources
+		RY: -1000, // down on XInput-style sources
+	})
+
+	if got := binary.LittleEndian.Uint16(report[3:5]); got != stickI16ToU16(-1000) {
+		t.Fatalf("LY inversion mismatch: got %d want %d", got, stickI16ToU16(-1000))
+	}
+	if got := binary.LittleEndian.Uint16(report[7:9]); got != stickI16ToU16(1000) {
+		t.Fatalf("RY inversion mismatch: got %d want %d", got, stickI16ToU16(1000))
 	}
 }
 
@@ -79,7 +126,7 @@ func TestBuildUSBInputReport_ShareAndHat(t *testing.T) {
 		t.Fatalf("New returned error: %v", err)
 	}
 
-	report := dev.buildUSBInputReport(InputState{
+	report := dev.buildUSBInputReport(elite2state.InputState{
 		DPad:     DPadUp | DPadRight,
 		Reserved: ReservedShare,
 	})
@@ -88,8 +135,9 @@ func TestBuildUSBInputReport_ShareAndHat(t *testing.T) {
 		t.Fatalf("hat mismatch: got %d want %d", got, DPadUSBUpRight)
 	}
 
-	if bits := buttonBits(report); bits != (1 << 16) {
-		t.Fatalf("share bit mismatch: got 0x%06X want 0x010000", bits)
+	// Share is now always at CC Record bit 16 for all Xbox profiles.
+	if want := uint32(1 << 16); buttonBits(report) != want {
+		t.Fatalf("share bit mismatch: got 0x%06X want 0x%06X", buttonBits(report), want)
 	}
 }
 
@@ -126,60 +174,15 @@ func TestNew_ProfileDefaultsAndOverrides(t *testing.T) {
 	}
 
 	inferred, err := New(&device.CreateOptions{
-		IdVendor:  ptr(DefaultVID),
-		IdProduct: ptr(DefaultPIDXboxOneElite),
+		IdVendor: ptr(DefaultVID),
+		// HHD-matching Elite identity.
+		IdProduct: ptr(uint16(0x02E3)),
 	})
 	if err != nil {
 		t.Fatalf("New(vid/pid infer) returned error: %v", err)
 	}
-	if got := inferred.GetDeviceSpecificArgs()["profile"]; got != ProfileXboxOneElite {
-		t.Fatalf("vid/pid profile infer mismatch: got %v want %s", got, ProfileXboxOneElite)
-	}
-
-	steam, err := New(&device.CreateOptions{
-		DeviceSpecific: map[string]any{"profile": ProfileSteamDeck},
-	})
-	if err != nil {
-		t.Fatalf("New(steamdeck) returned error: %v", err)
-	}
-	if got := steam.descriptor.Device.IDVendor; got != DefaultVIDSteam {
-		t.Fatalf("steamdeck VID mismatch: got 0x%04X want 0x%04X", got, DefaultVIDSteam)
-	}
-	if got := steam.descriptor.Device.IDProduct; got != DefaultPIDSteamDeck {
-		t.Fatalf("steamdeck PID mismatch: got 0x%04X want 0x%04X", got, DefaultPIDSteamDeck)
-	}
-
-	steamGenericInferred, err := New(&device.CreateOptions{
-		IdVendor:  ptr(DefaultVIDSteam),
-		IdProduct: ptr(DefaultPIDSteamGeneric),
-	})
-	if err != nil {
-		t.Fatalf("New(steam generic infer) returned error: %v", err)
-	}
-	if got := steamGenericInferred.GetDeviceSpecificArgs()["profile"]; got != ProfileSteamGeneric {
-		t.Fatalf("steam generic profile infer mismatch: got %v want %s", got, ProfileSteamGeneric)
-	}
-	for _, pid := range []uint16{
-		DefaultPIDSteamMsiClaw,
-		DefaultPIDSteamLenovoLegionGo2,
-		DefaultPIDSteamZotacZone,
-		DefaultPIDSteamAsusRogAlly,
-		DefaultPIDSteamLenovoLegionGo,
-		DefaultPIDSteamLenovoLegionGoS,
-	} {
-		inferred, err := New(&device.CreateOptions{
-			IdVendor:  ptr(DefaultVIDSteam),
-			IdProduct: ptr(pid),
-		})
-		if err != nil {
-			t.Fatalf("New(steam family infer pid=0x%04X) returned error: %v", pid, err)
-		}
-		if got := inferred.GetDeviceSpecificArgs()["profile"]; got != ProfileSteamGeneric {
-			t.Fatalf("steam family profile infer mismatch for pid=0x%04X: got %v want %s", pid, got, ProfileSteamGeneric)
-		}
-		if got := inferred.descriptor.Device.IDProduct; got != pid {
-			t.Fatalf("steam family PID override mismatch for pid=0x%04X: got 0x%04X", pid, got)
-		}
+	if got := inferred.GetDeviceSpecificArgs()["profile"]; got != ProfileElite2 {
+		t.Fatalf("vid/pid profile infer mismatch: got %v want %s", got, ProfileElite2)
 	}
 
 	series, err := New(&device.CreateOptions{
@@ -208,6 +211,9 @@ func TestProfileDescriptorVariants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New(nil) returned error: %v", err)
 	}
+	if got := elite.descriptor.Strings[2]; got != "Xbox Wireless Controller" {
+		t.Fatalf("default elite product string mismatch: got %q want %q", got, "Xbox Wireless Controller")
+	}
 	one, err := New(&device.CreateOptions{
 		DeviceSpecific: map[string]any{"profile": ProfileXboxOneElite},
 	})
@@ -220,35 +226,13 @@ func TestProfileDescriptorVariants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New(xbox-series) returned error: %v", err)
 	}
-	steam, err := New(&device.CreateOptions{
-		DeviceSpecific: map[string]any{"profile": ProfileSteamDeck},
-	})
-	if err != nil {
-		t.Fatalf("New(steamdeck) returned error: %v", err)
-	}
 
-	if bytes.Equal(elite.descriptor.Interfaces[0].HID.ReportRaw, one.descriptor.Interfaces[0].HID.ReportRaw) {
-		t.Fatal("elite2 and xbox-one-elite descriptors should differ")
+	if !bytes.Equal(elite.descriptor.Interfaces[0].HID.ReportRaw, one.descriptor.Interfaces[0].HID.ReportRaw) {
+		t.Fatal("elite2 should match xbox-one-elite descriptor")
 	}
-	if bytes.Equal(one.descriptor.Interfaces[0].HID.ReportRaw, series.descriptor.Interfaces[0].HID.ReportRaw) {
-		t.Fatal("xbox-one-elite and xbox-series descriptors should differ")
-	}
-	if got := len(steam.descriptor.Interfaces[0].HID.ReportRaw); got != len(steamDeckControllerHIDDescriptor) {
-		t.Fatalf("steam descriptor len mismatch: got %d want %d", got, len(steamDeckControllerHIDDescriptor))
-	}
-	if got := steam.descriptor.Interfaces[0].Endpoints[0].WMaxPacketSize; got != 64 {
-		t.Fatalf("steam endpoint packet size mismatch: got %d want 64", got)
-	}
-	if got := steam.descriptor.Strings[1]; got != "Valve Software" {
-		t.Fatalf("steam manufacturer mismatch: got %q", got)
-	}
-
-	report := steam.buildUSBInputReport(InputState{})
-	if len(report) != InputReportSizeSteamDeck {
-		t.Fatalf("steam report len mismatch: got %d want %d", len(report), InputReportSizeSteamDeck)
-	}
-	if report[2] != SteamDeckInputReportType {
-		t.Fatalf("steam report type mismatch: got 0x%02X want 0x%02X", report[2], SteamDeckInputReportType)
+	// All Xbox BLE profiles now share the same real Xbox BLE descriptor (15 buttons + CC Record).
+	if !bytes.Equal(one.descriptor.Interfaces[0].HID.ReportRaw, series.descriptor.Interfaces[0].HID.ReportRaw) {
+		t.Fatal("xbox-one-elite and xbox-series should share the same Xbox BLE descriptor")
 	}
 }
 
@@ -259,11 +243,12 @@ func TestBuildUSBInputReport_ProfileButtonLayouts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New(xbox-series) returned error: %v", err)
 	}
-	seriesBits := buttonBits(series.buildUSBInputReport(InputState{
+	seriesBits := buttonBits(series.buildUSBInputReport(elite2state.InputState{
 		Buttons:  ButtonA | ButtonP1 | ButtonP2 | ButtonP3 | ButtonP4,
 		Reserved: ReservedShare,
 	}))
-	if want := uint32((1 << 0) | (1 << 11)); seriesBits != want {
+	// Xbox Series: A at bit 0, no paddles, Share at CC Record bit 16.
+	if want := uint32((1 << 0) | (1 << 16)); seriesBits != want {
 		t.Fatalf("xbox-series bits mismatch: got 0x%06X want 0x%06X", seriesBits, want)
 	}
 
@@ -273,109 +258,146 @@ func TestBuildUSBInputReport_ProfileButtonLayouts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New(xbox-one-elite) returned error: %v", err)
 	}
-	oneBits := buttonBits(one.buildUSBInputReport(InputState{
+	oneBits := buttonBits(one.buildUSBInputReport(elite2state.InputState{
 		Buttons:  ButtonA | ButtonP1,
 		Reserved: ReservedShare,
 	}))
-	if oneBits&(1<<16) != 0 {
-		t.Fatalf("xbox-one-elite should not expose share bit, got 0x%06X", oneBits)
+	// Xbox One Elite: Share now at CC Record bit 16 for all profiles.
+	if oneBits&(1<<16) == 0 {
+		t.Fatalf("xbox-one-elite should expose share at CC Record bit 16, got 0x%06X", oneBits)
 	}
 	if oneBits&(1<<12) == 0 {
 		t.Fatalf("xbox-one-elite should expose P1 bit, got 0x%06X", oneBits)
 	}
 }
 
-func TestBuildUSBInputReport_SteamDeckBitPacking(t *testing.T) {
-	steam, err := New(&device.CreateOptions{
-		DeviceSpecific: map[string]any{"profile": ProfileSteamGeneric},
-	})
+func TestParseXboxOutputReport_LegacyReportID2(t *testing.T) {
+	dev, err := New(nil)
 	if err != nil {
-		t.Fatalf("New(steamdeck-generic) returned error: %v", err)
+		t.Fatalf("New returned error: %v", err)
 	}
 
-	// Steam Deck input bytes use msb0 numbering.
-	report := steam.buildUSBInputReport(InputState{Buttons: ButtonA})
-	if got := report[8]; got != 0x80 {
-		t.Fatalf("A bit mismatch: got 0x%02X want 0x80", got)
-	}
-
-	report = steam.buildUSBInputReport(InputState{Buttons: ButtonX})
-	if got := report[8]; got != 0x40 {
-		t.Fatalf("X bit mismatch: got 0x%02X want 0x40", got)
-	}
-
-	report = steam.buildUSBInputReport(InputState{Buttons: ButtonB})
-	if got := report[8]; got != 0x20 {
-		t.Fatalf("B bit mismatch: got 0x%02X want 0x20", got)
-	}
-
-	report = steam.buildUSBInputReport(InputState{Buttons: ButtonY})
-	if got := report[8]; got != 0x10 {
-		t.Fatalf("Y bit mismatch: got 0x%02X want 0x10", got)
-	}
-
-	report = steam.buildUSBInputReport(InputState{Buttons: ButtonP2})
-	if got := report[9]; got != 0x80 {
-		t.Fatalf("L5 bit mismatch: got 0x%02X want 0x80", got)
-	}
-
-	report = steam.buildUSBInputReport(InputState{DPad: DPadUp | DPadRight})
-	if got := report[9]; got != 0x03 {
-		t.Fatalf("DPad up+right bits mismatch: got 0x%02X want 0x03", got)
-	}
-
-	report = steam.buildUSBInputReport(InputState{Reserved: ReservedShare})
-	if got := report[14]; got != 0x04 {
-		t.Fatalf("quick access bit mismatch: got 0x%02X want 0x04", got)
-	}
-
-	report = steam.buildUSBInputReport(InputState{
-		LY: -1234, RY: 2345,
-		GyroX: 111, GyroY: -222, GyroZ: 333,
-		AccelX: -444, AccelY: 555, AccelZ: -666,
+	called := false
+	var got elite2state.OutputState
+	dev.SetOutputCallback(func(feedback elite2state.OutputState) {
+		called = true
+		got = feedback
 	})
-	if got := int16(binary.LittleEndian.Uint16(report[50:52])); got != -1234 {
-		t.Fatalf("steam LY mismatch: got %d want -1234", got)
+
+	ok := dev.parseXboxOutputReport(0, []byte{ReportIDOutput, 10, 20, 30, 40})
+	if !ok {
+		t.Fatal("parseXboxOutputReport returned false")
 	}
-	if got := int16(binary.LittleEndian.Uint16(report[54:56])); got != 2345 {
-		t.Fatalf("steam RY mismatch: got %d want 2345", got)
+	if !called {
+		t.Fatal("output callback was not called")
 	}
-	if got := int16(binary.LittleEndian.Uint16(report[24:26])); got != -444 {
-		t.Fatalf("steam accelX mismatch: got %d want -444", got)
+	if got.RumbleLeft != 10 || got.RumbleRight != 20 || got.RumbleTriggerLeft != 30 || got.RumbleTriggerRight != 40 {
+		t.Fatalf("legacy rumble mismatch: got %+v", got)
 	}
-	if got := int16(binary.LittleEndian.Uint16(report[26:28])); got != 555 {
-		t.Fatalf("steam accelY mismatch: got %d want 555", got)
-	}
-	if got := int16(binary.LittleEndian.Uint16(report[28:30])); got != -666 {
-		t.Fatalf("steam accelZ mismatch: got %d want -666", got)
-	}
-	if got := int16(binary.LittleEndian.Uint16(report[30:32])); got != 111 {
-		t.Fatalf("steam gyroX mismatch: got %d want 111", got)
-	}
-	if got := int16(binary.LittleEndian.Uint16(report[32:34])); got != -222 {
-		t.Fatalf("steam gyroY mismatch: got %d want -222", got)
-	}
-	if got := int16(binary.LittleEndian.Uint16(report[34:36])); got != 333 {
-		t.Fatalf("steam gyroZ mismatch: got %d want 333", got)
+}
+
+func TestParseXboxOutputReport_FFReportID3WithMask(t *testing.T) {
+	dev, err := New(nil)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
 	}
 
-	report = steam.buildUSBInputReport(InputState{
-		TouchFlags: TouchFlagRightPadTouch | TouchFlagRightPadPress,
-		RPadX:      1234,
-		RPadY:      -2345,
-		RPadForce:  9000,
+	called := false
+	var got elite2state.OutputState
+	dev.SetOutputCallback(func(feedback elite2state.OutputState) {
+		called = true
+		got = feedback
 	})
-	if got := report[10]; got != 0x14 {
-		t.Fatalf("right touch/press bits mismatch: got 0x%02X want 0x14", got)
+
+	// reportID=0x03, enable=weak+triggerRight, left/right/strong/weak magnitudes=10/20/30/40
+	ok := dev.parseXboxOutputReport(0, []byte{
+		ReportIDOutputRumbleFF,
+		RumbleMaskWeak | RumbleMaskTriggerRight,
+		10, 20, 30, 40,
+		0, 0, 0,
+	})
+	if !ok {
+		t.Fatal("parseXboxOutputReport returned false")
 	}
-	if got := int16(binary.LittleEndian.Uint16(report[20:22])); got != 1234 {
-		t.Fatalf("steam r_pad_x mismatch: got %d want 1234", got)
+	if !called {
+		t.Fatal("output callback was not called")
 	}
-	if got := int16(binary.LittleEndian.Uint16(report[22:24])); got != -2345 {
-		t.Fatalf("steam r_pad_y mismatch: got %d want -2345", got)
+
+	if got.RumbleLeft != 0 {
+		t.Fatalf("main left should be masked out, got %d", got.RumbleLeft)
 	}
-	if got := binary.LittleEndian.Uint16(report[58:60]); got != 9000 {
-		t.Fatalf("steam r_pad_force mismatch: got %d want 9000", got)
+	if got.RumbleRight != rumblePercentToU8(40) {
+		t.Fatalf("main right mismatch: got %d want %d", got.RumbleRight, rumblePercentToU8(40))
+	}
+	if got.RumbleTriggerLeft != 0 {
+		t.Fatalf("trigger left should be masked out, got %d", got.RumbleTriggerLeft)
+	}
+	if got.RumbleTriggerRight != rumblePercentToU8(20) {
+		t.Fatalf("trigger right mismatch: got %d want %d", got.RumbleTriggerRight, rumblePercentToU8(20))
+	}
+}
+
+func TestParseXboxOutputReport_ControlPayloadWithoutReportID(t *testing.T) {
+	dev, err := New(nil)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+
+	called := false
+	var got elite2state.OutputState
+	dev.SetOutputCallback(func(feedback elite2state.OutputState) {
+		called = true
+		got = feedback
+	})
+
+	// Simulate HID SetReport(reportID=0x02) where data payload omits report ID.
+	ok := dev.parseXboxOutputReport(ReportIDOutput, []byte{1, 2, 3, 4})
+	if !ok {
+		t.Fatal("parseXboxOutputReport returned false")
+	}
+	if !called {
+		t.Fatal("output callback was not called")
+	}
+	if got.RumbleLeft != 1 || got.RumbleRight != 2 || got.RumbleTriggerLeft != 3 || got.RumbleTriggerRight != 4 {
+		t.Fatalf("control payload parse mismatch: got %+v", got)
+	}
+}
+
+func TestHandleControl_SetFeatureFFReportID3(t *testing.T) {
+	dev, err := New(nil)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+
+	called := false
+	var got elite2state.OutputState
+	dev.SetOutputCallback(func(feedback elite2state.OutputState) {
+		called = true
+		got = feedback
+	})
+
+	// HID SetReport Feature(id=0x03) carrying FF payload without report ID byte.
+	_, handled := dev.HandleControl(
+		0x21, // host-to-device class interface request
+		0x09, // SET_REPORT
+		0x0303,
+		0,
+		8,
+		[]byte{
+			RumbleMaskWeak | RumbleMaskStrong,
+			0, 0,
+			90, 80,
+			0xFF, 0x00, 0xFF,
+		},
+	)
+	if !handled {
+		t.Fatal("HandleControl did not handle FF SetFeature report")
+	}
+	if !called {
+		t.Fatal("output callback was not called")
+	}
+	if got.RumbleLeft != rumblePercentToU8(90) || got.RumbleRight != rumblePercentToU8(80) {
+		t.Fatalf("feature FF rumble mismatch: got %+v", got)
 	}
 }
 

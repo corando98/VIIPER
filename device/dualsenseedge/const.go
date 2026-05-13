@@ -72,17 +72,19 @@ const (
 
 const DPadMask uint8 = 0x0F
 
-// Gyro/Accel scale factors (same as DS4 / DualSense).
+// Gyro/Accel scale factors matching the USB report domain.
+//   Gyro: BMI323 ±2000 dps passthrough = 16.384 LSB/dps
+//   Accel: BMI323 4096 LSB/g × ScaleAccel(×2) = 8192 LSB/g = 835.07 LSB/(m/s²)
 const (
-	GyroCountsPerDps  = 16.0
-	AccelCountsPerMS2 = 512.0
+	GyroCountsPerDps  = 16.384
+	AccelCountsPerMS2 = 835.07 // 8192 / 9.81
 )
 
-// Default accelerometer values (controller flat on table).
+// Default accelerometer values (controller flat on table, before C# input starts).
 const (
 	DefaultAccelXRaw int16 = 0
 	DefaultAccelYRaw int16 = 0
-	DefaultAccelZRaw int16 = -5023 // -9.81 * 512
+	DefaultAccelZRaw int16 = -8192 // -1g (8192 counts/g)
 )
 
 // Touchpad dimensions.

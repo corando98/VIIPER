@@ -1,4 +1,4 @@
-package xboxelite2
+package steamcontroller
 
 import (
 	"fmt"
@@ -7,13 +7,14 @@ import (
 	"net"
 
 	"github.com/Alia5/VIIPER/device"
+	"github.com/Alia5/VIIPER/device/xboxelite2"
 	elite2state "github.com/Alia5/VIIPER/internal/inputstate/elite2"
 	"github.com/Alia5/VIIPER/internal/server/api"
 	"github.com/Alia5/VIIPER/usb"
 )
 
 func init() {
-	api.RegisterDevice("xboxelite2", &handler{})
+	api.RegisterDevice("steamcontroller", &handler{})
 }
 
 type handler struct{}
@@ -25,9 +26,9 @@ func (h *handler) StreamHandler() api.StreamHandlerFunc {
 		if devPtr == nil || *devPtr == nil {
 			return fmt.Errorf("nil device")
 		}
-		xdev, ok := (*devPtr).(*XboxElite2)
+		xdev, ok := (*devPtr).(*SteamController)
 		if !ok {
-			return fmt.Errorf("device is not xboxelite2")
+			return fmt.Errorf("device is not steamcontroller")
 		}
 
 		xdev.SetOutputCallback(func(feedback elite2state.OutputState) {
@@ -43,6 +44,7 @@ func (h *handler) StreamHandler() api.StreamHandlerFunc {
 
 		// Support v2 (33-byte: IMU + Steam touch), v1 (26-byte: IMU), and legacy (14-byte).
 		// This prevents hard-to-debug desync ghost input when client/server versions differ.
+		// The wire format is shared with xboxelite2 (defined in internal/inputstate/elite2).
 		frameSize := 0
 		readBuf := make([]byte, 512)
 		pending := make([]byte, 0, elite2state.InputStateSize*8)
@@ -65,11 +67,11 @@ func (h *handler) StreamHandler() api.StreamHandlerFunc {
 				if detected, ok := detectInputFrameSize(pending); ok {
 					frameSize = detected
 					if frameSize == elite2state.LegacyInputStateSize {
-						logger.Warn("xboxelite2: detected legacy 14-byte stream; IMU forwarding disabled for this session")
+						logger.Warn("steamcontroller: detected legacy 14-byte stream; IMU forwarding disabled for this session")
 					} else if frameSize == elite2state.InputStateV1Size {
-						logger.Info("xboxelite2: detected 26-byte stream with IMU")
+						logger.Info("steamcontroller: detected 26-byte stream with IMU")
 					} else {
-						logger.Info("xboxelite2: detected 33-byte stream with IMU + Steam touchpad")
+						logger.Info("steamcontroller: detected 33-byte stream with IMU + Steam touchpad")
 					}
 				} else if len(pending) > elite2state.InputStateSize*128 {
 					// Keep memory bounded while waiting for enough data to detect framing.
@@ -151,10 +153,10 @@ func plausibleFrame(frame []byte, frameSize int) bool {
 	}
 	dpad := frame[12]
 	reserved := frame[13]
-	if dpad&^DPadMask != 0 {
+	if dpad&^xboxelite2.DPadMask != 0 {
 		return false
 	}
-	if reserved&^ReservedShare != 0 {
+	if reserved&^xboxelite2.ReservedShare != 0 {
 		return false
 	}
 	if frameSize == elite2state.InputStateSize {

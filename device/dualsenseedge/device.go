@@ -17,8 +17,12 @@ type DualSenseEdge struct {
 	outputFunc func(OutputState)
 	descriptor usb.Descriptor
 
-	seqCounter       uint8
+	seqCounter         uint8
 	usbReportTimestamp uint32
+
+	// Last known LED state — preserved across rumble-only reports.
+	lastLedRed, lastLedGreen, lastLedBlue uint8
+	lastPlayerLeds                         uint8
 }
 
 func New(o *device.CreateOptions) (*DualSenseEdge, error) {
@@ -79,21 +83,29 @@ func (d *DualSenseEdge) parseOutputReport(out []byte) {
 	feedback := OutputState{
 		RumbleSmall: out[OutOffsetRumbleSmall],
 		RumbleLarge: out[OutOffsetRumbleLarge],
+		// Start with last known LED state so rumble-only reports
+		// don't zero out the color on the physical controller.
+		LedRed:     d.lastLedRed,
+		LedGreen:   d.lastLedGreen,
+		LedBlue:    d.lastLedBlue,
+		PlayerLeds: d.lastPlayerLeds,
 	}
-	// Flag2 (byte 39) controls which LED fields are valid:
-	//   bit 0x02 = lightbar RGB update
-	//   bit 0x04 = player LEDs update
-	// Only read LED/player values when the host explicitly sets them,
-	// otherwise rumble-only reports would zero out the LEDs.
-	if len(out) > OutOffsetFlag2 {
-		flag2 := out[OutOffsetFlag2]
-		if flag2&0x02 != 0 && len(out) > OutOffsetLedBlue {
+	// Flag1 (byte 2) controls which LED fields are valid:
+	//   bit 0x04 = lightbar RGB control enable
+	//   bit 0x10 = player indicator LEDs control enable
+	if len(out) > OutOffsetFlag1 {
+		flag1 := out[OutOffsetFlag1]
+		if flag1&0x04 != 0 && len(out) > OutOffsetLedBlue {
 			feedback.LedRed = out[OutOffsetLedRed]
 			feedback.LedGreen = out[OutOffsetLedGreen]
 			feedback.LedBlue = out[OutOffsetLedBlue]
+			d.lastLedRed = feedback.LedRed
+			d.lastLedGreen = feedback.LedGreen
+			d.lastLedBlue = feedback.LedBlue
 		}
-		if flag2&0x04 != 0 && len(out) > OutOffsetPlayerLEDs {
+		if flag1&0x10 != 0 && len(out) > OutOffsetPlayerLEDs {
 			feedback.PlayerLeds = out[OutOffsetPlayerLEDs]
+			d.lastPlayerLeds = feedback.PlayerLeds
 		}
 	}
 	if d.outputFunc != nil {
@@ -359,6 +371,11 @@ func (d *DualSenseEdge) buildUSBInputReport(s InputState) []byte {
 	}
 	encodeTouchCoords(b[38:41], s.Touch2X, s.Touch2Y)
 
+	// b[49]: Active profile (DSE) — upper nibble = profile index (1-4),
+	//        lower 2 bits = mode (0x00 = normal). Must be non-zero for
+	//        tester sites to detect normal mode (JS truthiness check).
+	b[49] = 0x10 // Profile 1, normal mode
+
 	// b[53]: Battery (fully charged)
 	b[53] = BatteryFullyCharged
 
@@ -366,25 +383,28 @@ func (d *DualSenseEdge) buildUSBInputReport(s InputState) []byte {
 }
 
 // Stock feature report responses.
+// Calibration data must match the actual sensor output in the USB report:
+//   Gyro: BMI323 ±2000 dps = 16.384 LSB/dps (passthrough) → at 500 dps ref = 8192 counts
+//   Accel: BMI323 4096 LSB/g × ScaleAccel(×2) = 8192 counts/g
 var featureReport05 = [41]byte{
 	0x05, // Report ID
 	0x00, 0x00, // Gyro Pitch Bias
 	0x00, 0x00, // Gyro Yaw Bias
 	0x00, 0x00, // Gyro Roll Bias
-	0x10, 0x27, // Gyro Pitch Plus  (10000)
-	0xF0, 0xD8, // Gyro Pitch Minus (-10000 as u16)
-	0x10, 0x27, // Gyro Yaw Plus
-	0xF0, 0xD8, // Gyro Yaw Minus
-	0x10, 0x27, // Gyro Roll Plus
-	0xF0, 0xD8, // Gyro Roll Minus
-	0xF4, 0x01, // Gyro Speed Plus  (500)
-	0xF4, 0x01, // Gyro Speed Minus (500)
-	0x10, 0x27, // Accel X Plus
-	0xF0, 0xD8, // Accel X Minus
-	0x10, 0x27, // Accel Y Plus
-	0xF0, 0xD8, // Accel Y Minus
-	0x10, 0x27, // Accel Z Plus
-	0xF0, 0xD8, // Accel Z Minus
+	0x00, 0x20, // Gyro Pitch Plus  (8192)
+	0x00, 0xE0, // Gyro Pitch Minus (-8192)
+	0x00, 0x20, // Gyro Yaw Plus    (8192)
+	0x00, 0xE0, // Gyro Yaw Minus   (-8192)
+	0x00, 0x20, // Gyro Roll Plus   (8192)
+	0x00, 0xE0, // Gyro Roll Minus  (-8192)
+	0xF4, 0x01, // Gyro Speed Plus  (500 dps)
+	0xF4, 0x01, // Gyro Speed Minus (500 dps)
+	0x00, 0x20, // Accel X Plus     (8192 = +1g)
+	0x00, 0xE0, // Accel X Minus    (-8192 = -1g)
+	0x00, 0x20, // Accel Y Plus     (8192)
+	0x00, 0xE0, // Accel Y Minus    (-8192)
+	0x00, 0x20, // Accel Z Plus     (8192)
+	0x00, 0xE0, // Accel Z Minus    (-8192)
 	0x0B, 0x00,
 	0x00, 0x00,
 	0x00, 0x00,

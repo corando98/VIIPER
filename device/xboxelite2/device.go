@@ -7,20 +7,19 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/Alia5/VIIPER/device"
+	elite2state "github.com/Alia5/VIIPER/internal/inputstate/elite2"
 	"github.com/Alia5/VIIPER/usb"
 	"github.com/Alia5/VIIPER/usbip"
 )
 
 type XboxElite2 struct {
-	inputState *InputState
+	inputState *elite2state.InputState
 	stateMu    sync.Mutex
-	outputFunc func(OutputState)
+	outputFunc func(elite2state.OutputState)
 	descriptor usb.Descriptor
 	profile    string
-	frame      uint32
 }
 
 type xboxElite2CreateOptions struct {
@@ -87,24 +86,21 @@ func parseProfile(profile string) (string, error) {
 		return ProfileElite2, nil
 	case ProfileElite2GIP, "xboxelite2-gip", "xbox-elite2-gip", "gip", "0x0b00", "0b00":
 		return ProfileElite2GIP, nil
+	case ProfileXboxOne, "xboxone", "xbox-one-s":
+		return ProfileXboxOne, nil
 	case ProfileXboxOneElite, "xbox-elite", "xboxoneelite", "xbox-one-elite-1", "elite1":
 		return ProfileXboxOneElite, nil
 	case ProfileXboxSeries, "xboxseries", "series":
 		return ProfileXboxSeries, nil
-	case ProfileSteamDeck, "steam-deck", "deck", "valve-steamdeck", "1205", "0x1205":
-		return ProfileSteamDeck, nil
-	case ProfileSteamGeneric, "steam-generic", "steam-controller", "deck-uhid", "12f0", "0x12f0":
-		return ProfileSteamGeneric, nil
 	default:
 		return "", fmt.Errorf(
-			"unsupported xboxelite2 profile %q (supported: %q, %q, %q, %q, %q, %q)",
+			"unsupported xboxelite2 profile %q (supported: %q, %q, %q, %q, %q)",
 			profile,
 			ProfileElite2,
 			ProfileElite2GIP,
+			ProfileXboxOne,
 			ProfileXboxOneElite,
 			ProfileXboxSeries,
-			ProfileSteamDeck,
-			ProfileSteamGeneric,
 		)
 	}
 }
@@ -115,26 +111,6 @@ func profileForIDs(vid, pid uint16) (string, bool) {
 		return ProfileElite2, true
 	case vid == DefaultVID && pid == DefaultPIDElite2GIP:
 		return ProfileElite2GIP, true
-	case vid == DefaultVID && pid == DefaultPIDXboxOneElite:
-		return ProfileXboxOneElite, true
-	case vid == DefaultVID && pid == DefaultPIDXboxSeries:
-		return ProfileXboxSeries, true
-	case vid == DefaultVIDSteam && pid == DefaultPIDSteamDeck:
-		return ProfileSteamDeck, true
-	case vid == DefaultVIDSteam && pid == DefaultPIDSteamGeneric:
-		return ProfileSteamGeneric, true
-	case vid == DefaultVIDSteam && pid == DefaultPIDSteamMsiClaw:
-		return ProfileSteamGeneric, true
-	case vid == DefaultVIDSteam && pid == DefaultPIDSteamLenovoLegionGo2:
-		return ProfileSteamGeneric, true
-	case vid == DefaultVIDSteam && pid == DefaultPIDSteamZotacZone:
-		return ProfileSteamGeneric, true
-	case vid == DefaultVIDSteam && pid == DefaultPIDSteamAsusRogAlly:
-		return ProfileSteamGeneric, true
-	case vid == DefaultVIDSteam && pid == DefaultPIDSteamLenovoLegionGo:
-		return ProfileSteamGeneric, true
-	case vid == DefaultVIDSteam && pid == DefaultPIDSteamLenovoLegionGoS:
-		return ProfileSteamGeneric, true
 	default:
 		return "", false
 	}
@@ -169,67 +145,64 @@ func (x *XboxElite2) applyProfileDefaults(profile string) {
 	x.descriptor = cloneDescriptor(defaultDescriptor)
 
 	switch profile {
+	case ProfileElite2:
+		// PID 0x0B13 (Xbox Wireless Controller Model 1914) — the PID that
+		// actually parses on Windows with our descriptor. SDL identifies as
+		// "Xbox Wireless Controller" / "Xbox Series X Controller". The
+		// "Elite 2" label is unreachable through USBIP HID without matching
+		// Microsoft's hardcoded byte layout for PIDs 0x0B05/0x0B00.
+		x.descriptor.Device.IDVendor = DefaultVID
+		x.descriptor.Device.IDProduct = DefaultPIDElite2
+		x.descriptor.Strings[2] = "Xbox Wireless Controller"
+		x.descriptor.Strings[3] = "VIIPER-XBOX-1914-01"
+		x.descriptor.Interfaces[0].HID.ReportRaw = append([]byte(nil), xboxBLEHIDDescriptor...)
 	case ProfileElite2GIP:
 		x.descriptor.Device.IDVendor = DefaultVID
 		x.descriptor.Device.IDProduct = DefaultPIDElite2GIP
-		x.descriptor.Strings[2] = "Microsoft X-Box One Elite 2 pad"
-		x.descriptor.Interfaces[0].HID.ReportRaw = append([]byte(nil), xboxElite2HIDDescriptor...)
+		x.descriptor.Strings[2] = "Xbox Wireless Controller"
+		x.descriptor.Strings[3] = "VIIPER-XE2GIP-01"
+		x.descriptor.Interfaces[0].HID.ReportRaw = append([]byte(nil), xboxBLEHIDDescriptor...)
+	case ProfileXboxOne:
+		x.descriptor.Device.IDVendor = DefaultVID
+		x.descriptor.Device.IDProduct = DefaultPIDXboxOne
+		x.descriptor.Strings[2] = "Xbox Wireless Controller"
+		x.descriptor.Strings[3] = "VIIPER-XBO-01"
+		x.descriptor.Interfaces[0].HID.ReportRaw = append([]byte(nil), xboxBLEHIDDescriptor...)
 	case ProfileXboxOneElite:
 		x.descriptor.Device.IDVendor = DefaultVID
 		x.descriptor.Device.IDProduct = DefaultPIDXboxOneElite
 		x.descriptor.Strings[2] = "Xbox One Elite Controller"
-		x.descriptor.Interfaces[0].HID.ReportRaw = append([]byte(nil), xboxOneEliteHIDDescriptor...)
+		x.descriptor.Strings[3] = "VIIPER-XE1-01"
+		x.descriptor.Interfaces[0].HID.ReportRaw = append([]byte(nil), xboxBLEHIDDescriptor...)
 	case ProfileXboxSeries:
 		x.descriptor.Device.IDVendor = DefaultVID
 		x.descriptor.Device.IDProduct = DefaultPIDXboxSeries
-		x.descriptor.Strings[2] = "Xbox Series X Controller"
-		x.descriptor.Interfaces[0].HID.ReportRaw = append([]byte(nil), xboxSeriesHIDDescriptor...)
-	case ProfileSteamDeck:
-		x.descriptor.Device.IDVendor = DefaultVIDSteam
-		x.descriptor.Device.IDProduct = DefaultPIDSteamDeck
-		x.descriptor.Strings[1] = "Valve Software"
-		x.descriptor.Strings[2] = "Steam Deck Controller"
-		x.descriptor.Interfaces[0].HID.ReportRaw = append([]byte(nil), steamDeckControllerHIDDescriptor...)
-		x.descriptor.Interfaces[0].Endpoints[0].WMaxPacketSize = 64
-		x.descriptor.Interfaces[0].Endpoints[1].WMaxPacketSize = 64
-	case ProfileSteamGeneric:
-		x.descriptor.Device.IDVendor = DefaultVIDSteam
-		x.descriptor.Device.IDProduct = DefaultPIDSteamGeneric
-		x.descriptor.Strings[1] = "Valve Software"
-		x.descriptor.Strings[2] = "Generic Steam Controller"
-		x.descriptor.Interfaces[0].HID.ReportRaw = append([]byte(nil), steamDeckControllerHIDDescriptor...)
-		x.descriptor.Interfaces[0].Endpoints[0].WMaxPacketSize = 64
-		x.descriptor.Interfaces[0].Endpoints[1].WMaxPacketSize = 64
+		x.descriptor.Strings[2] = "Xbox Wireless Controller"
+		x.descriptor.Strings[3] = "VIIPER-XSX-01"
+		x.descriptor.Interfaces[0].HID.ReportRaw = append([]byte(nil), xboxBLEHIDDescriptor...)
 	default:
 		x.descriptor.Device.IDVendor = DefaultVID
 		x.descriptor.Device.IDProduct = DefaultPIDElite2
-		x.descriptor.Strings[2] = "Xbox Elite Wireless Controller Series 2"
-		x.descriptor.Interfaces[0].HID.ReportRaw = append([]byte(nil), xboxElite2HIDDescriptor...)
+		x.descriptor.Strings[2] = "Xbox Wireless Controller"
+		x.descriptor.Strings[3] = "VIIPER-XBOX-1914-01"
+		x.descriptor.Interfaces[0].HID.ReportRaw = append([]byte(nil), xboxBLEHIDDescriptor...)
 	}
 }
 
-func (x *XboxElite2) isSteamProfile() bool {
-	return x.profile == ProfileSteamDeck || x.profile == ProfileSteamGeneric
-}
-
-func (x *XboxElite2) buttonLayout() (includePaddles bool, shareBit int) {
+func (x *XboxElite2) buttonLayout() (includePaddles bool) {
 	switch x.profile {
-	case ProfileXboxOneElite:
-		return true, -1
-	case ProfileXboxSeries:
-		return false, 11
-	case ProfileElite2, ProfileElite2GIP:
-		fallthrough
+	case ProfileXboxOne, ProfileXboxSeries:
+		return false
 	default:
-		return true, 16
+		return true
 	}
 }
 
-func (x *XboxElite2) SetOutputCallback(f func(OutputState)) {
+func (x *XboxElite2) SetOutputCallback(f func(elite2state.OutputState)) {
 	x.outputFunc = f
 }
 
-func (x *XboxElite2) UpdateInputState(state *InputState) {
+func (x *XboxElite2) UpdateInputState(state *elite2state.InputState) {
 	x.stateMu.Lock()
 	defer x.stateMu.Unlock()
 	x.inputState = state
@@ -240,11 +213,12 @@ func (x *XboxElite2) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
 		switch ep {
 		case 1: // 0x81 - main input reports
 			x.stateMu.Lock()
-			var st InputState
+			var st elite2state.InputState
 			if x.inputState != nil {
 				st = *x.inputState
 			}
 			x.stateMu.Unlock()
+
 			return x.buildUSBInputReport(st)
 		default:
 			return nil
@@ -252,53 +226,102 @@ func (x *XboxElite2) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
 	}
 
 	if dir == usbip.DirOut && ep == 1 {
-		if x.isSteamProfile() {
-			x.parseSteamDeckOutputReport(out)
-		} else if len(out) >= OutputReportSize && out[0] == ReportIDOutput {
-			x.parseXboxOutputReport(out)
-		}
+		x.parseXboxOutputReport(0, out)
 	}
 
 	return nil
 }
 
-func (x *XboxElite2) parseXboxOutputReport(out []byte) {
-	feedback := OutputState{
-		RumbleLeft:         out[1],
-		RumbleRight:        out[2],
-		RumbleTriggerLeft:  out[3],
-		RumbleTriggerRight: out[4],
-	}
-	if x.outputFunc != nil {
-		x.outputFunc(feedback)
+func xboxOutputReportID(reportID uint8) bool {
+	return reportID == ReportIDOutput || reportID == ReportIDOutputRumbleFF
+}
+
+func xboxOutputPayloadSize(reportID uint8) int {
+	switch reportID {
+	case ReportIDOutput:
+		return OutputReportSize - 1
+	case ReportIDOutputRumbleFF:
+		return OutputReportSizeRumbleFF - 1
+	default:
+		return 0
 	}
 }
 
-func (x *XboxElite2) parseSteamDeckOutputReport(out []byte) {
-	start := 0
-	// Some stacks prefix an extra report-id byte (0x00) before command payload.
-	if len(out) >= 10 && out[0] == 0x00 {
-		start = 1
-	}
-	if len(out) < start+9 {
-		return
-	}
-	// Steam Deck rumble command (TriggerRumbleCommand).
-	if out[start] != SteamDeckRumbleCommandType {
-		return
+func normalizeXboxOutputReport(setupReportID uint8, data []byte) (reportID uint8, payload []byte, ok bool) {
+	// HID SetReport over control provides the report ID in wValue.
+	// Prefer that ID to avoid ambiguity with payload byte 0 (e.g. FF enable=0x03).
+	if xboxOutputReportID(setupReportID) {
+		expected := xboxOutputPayloadSize(setupReportID)
+		if len(data) >= expected+2 && data[0] == 0x00 && data[1] == setupReportID {
+			return setupReportID, data[2:], true
+		}
+		if len(data) >= expected+1 && data[0] == setupReportID {
+			return setupReportID, data[1:], true
+		}
+		return setupReportID, data, true
 	}
 
-	left := binary.LittleEndian.Uint16(out[start+5 : start+7])
-	right := binary.LittleEndian.Uint16(out[start+7 : start+9])
-	feedback := OutputState{
-		RumbleLeft:         uint8(left >> 8),
-		RumbleRight:        uint8(right >> 8),
-		RumbleTriggerLeft:  0,
-		RumbleTriggerRight: 0,
+	// Some hosts prepend a zero byte before report ID on interrupt OUT.
+	if len(data) >= 2 && data[0] == 0x00 && xboxOutputReportID(data[1]) {
+		return data[1], data[2:], true
 	}
+	// Most interrupt OUT payloads include report ID in byte 0.
+	if len(data) >= 1 && xboxOutputReportID(data[0]) {
+		return data[0], data[1:], true
+	}
+	return 0, nil, false
+}
+
+func (x *XboxElite2) parseXboxOutputReport(setupReportID uint8, data []byte) bool {
+	reportID, payload, ok := normalizeXboxOutputReport(setupReportID, data)
+	if !ok {
+		return false
+	}
+
+	var feedback elite2state.OutputState
+	switch reportID {
+	case ReportIDOutput:
+		if len(payload) < OutputReportSize-1 {
+			return false
+		}
+		feedback = elite2state.OutputState{
+			RumbleLeft:         payload[0],
+			RumbleRight:        payload[1],
+			RumbleTriggerLeft:  payload[2],
+			RumbleTriggerRight: payload[3],
+		}
+	case ReportIDOutputRumbleFF:
+		if len(payload) < OutputReportSizeRumbleFF-1 {
+			return false
+		}
+		enable := payload[0]
+		feedback = elite2state.OutputState{
+			// Xbox ff_report carries main motors as strong/weak magnitudes.
+			RumbleLeft:         rumblePercentToU8(payload[3]),
+			RumbleRight:        rumblePercentToU8(payload[4]),
+			RumbleTriggerLeft:  rumblePercentToU8(payload[1]),
+			RumbleTriggerRight: rumblePercentToU8(payload[2]),
+		}
+		if enable&RumbleMaskStrong == 0 {
+			feedback.RumbleLeft = 0
+		}
+		if enable&RumbleMaskWeak == 0 {
+			feedback.RumbleRight = 0
+		}
+		if enable&RumbleMaskTriggerLeft == 0 {
+			feedback.RumbleTriggerLeft = 0
+		}
+		if enable&RumbleMaskTriggerRight == 0 {
+			feedback.RumbleTriggerRight = 0
+		}
+	default:
+		return false
+	}
+
 	if x.outputFunc != nil {
 		x.outputFunc(feedback)
 	}
+	return true
 }
 
 func (x *XboxElite2) HandleControl(bmRequestType, bRequest uint8, wValue, _ uint16, wLength uint16, data []byte) ([]byte, bool) {
@@ -317,9 +340,9 @@ func (x *XboxElite2) HandleControl(bmRequestType, bRequest uint8, wValue, _ uint
 	reportID := uint8(wValue & 0xFF)
 
 	if bmRequestType == 0xA1 && bRequest == hidGetReport {
-		if reportType == reportTypeInput && (x.isSteamProfile() || reportID == ReportIDInput) {
+		if reportType == reportTypeInput && reportID == ReportIDInput {
 			x.stateMu.Lock()
-			var st InputState
+			var st elite2state.InputState
 			if x.inputState != nil {
 				st = *x.inputState
 			}
@@ -331,7 +354,7 @@ func (x *XboxElite2) HandleControl(bmRequestType, bRequest uint8, wValue, _ uint
 			return report, true
 		}
 
-		if reportType == reportTypeFeature && !x.isSteamProfile() && reportID == 0x03 {
+		if reportType == reportTypeFeature && reportID == 0x03 {
 			buf := make([]byte, 5)
 			buf[0] = 0x03
 			// Firmware version placeholder.
@@ -345,31 +368,23 @@ func (x *XboxElite2) HandleControl(bmRequestType, bRequest uint8, wValue, _ uint
 		if reportType == reportTypeFeature {
 			size := int(wLength)
 			if size <= 0 {
-				if x.isSteamProfile() {
-					size = InputReportSizeSteamDeck
-				} else {
-					size = 16
-				}
+				size = 16
 			}
 			buf := make([]byte, size)
-			if !x.isSteamProfile() {
-				buf[0] = reportID
-			}
+			buf[0] = reportID
 			return buf, true
 		}
 	}
 
 	if bmRequestType == 0x21 && bRequest == hidSetReport {
-		if x.isSteamProfile() {
-			if reportType == reportTypeOutput || reportType == reportTypeFeature {
-				x.parseSteamDeckOutputReport(data)
+		if reportType == reportTypeOutput || reportType == reportTypeFeature {
+			// Some hosts tunnel Xbox FF report 0x03 via SetFeature.
+			if x.parseXboxOutputReport(reportID, data) {
 				return nil, true
 			}
-		} else if reportType == reportTypeOutput && reportID == ReportIDOutput && len(data) >= OutputReportSize {
-			x.parseXboxOutputReport(data)
-			return nil, true
-		} else if reportType == reportTypeFeature {
-			return nil, true
+			if reportType == reportTypeFeature {
+				return nil, true
+			}
 		}
 	}
 
@@ -380,6 +395,17 @@ func (x *XboxElite2) HandleControl(bmRequestType, bRequest uint8, wValue, _ uint
 		"reportID", reportID)
 
 	return nil, false
+}
+
+// clampI16 converts a float64 to int16 with saturation.
+func clampI16(v float64) int16 {
+	if v > 32767 {
+		return 32767
+	}
+	if v < -32767 {
+		return -32767
+	}
+	return int16(v)
 }
 
 func (x *XboxElite2) GetDescriptor() *usb.Descriptor {
@@ -393,32 +419,34 @@ func (x *XboxElite2) GetDeviceSpecificArgs() map[string]any {
 }
 
 // buildUSBInputReport builds the host-facing HID report for the currently selected profile.
-func (x *XboxElite2) buildUSBInputReport(s InputState) []byte {
-	if x.isSteamProfile() {
-		return x.buildSteamDeckInputReport(s)
-	}
+func (x *XboxElite2) buildUSBInputReport(s elite2state.InputState) []byte {
 	return x.buildXboxInputReport(s)
 }
 
-func (x *XboxElite2) buildXboxInputReport(s InputState) []byte {
+func (x *XboxElite2) buildXboxInputReport(s elite2state.InputState) []byte {
 	b := make([]byte, InputReportSize)
 	b[0] = ReportIDInput
 
-	// Sticks: signed i16 -> unsigned u16 centered at 32768.
+	// Axis order for Xbox BLE profiles: X, Y, Rx, Ry, Z(LT), Rz(RT).
 	binary.LittleEndian.PutUint16(b[1:3], stickI16ToU16(s.LX))
-	binary.LittleEndian.PutUint16(b[3:5], stickI16ToU16(s.LY))
-	binary.LittleEndian.PutUint16(b[5:7], stickI16ToU16(s.RX))
-	binary.LittleEndian.PutUint16(b[7:9], stickI16ToU16(s.RY))
+	binary.LittleEndian.PutUint16(b[3:5], stickI16ToU16(invertStickY(s.LY)))
 
-	// Triggers: u8 -> u10 packed into 16-bit fields.
+	binary.LittleEndian.PutUint16(b[5:7], stickI16ToU16(s.RX))
+	binary.LittleEndian.PutUint16(b[7:9], stickI16ToU16(invertStickY(s.RY)))
+	// Triggers as 10-bit (0..1023). SDL HIDAPI keys on the descriptor's
+	// Logical Max to distinguish triggers (10-bit) from an alt right
+	// stick (16-bit) — see SDL_hidapi_xboxone.c:730-770.
 	binary.LittleEndian.PutUint16(b[9:11], triggerU8ToU10(s.LT))
 	binary.LittleEndian.PutUint16(b[11:13], triggerU8ToU10(s.RT))
 
 	// Hat switch.
 	b[13] = dpadBitmaskToHat(s.DPad) & DPadMask
 
-	// Button packing layout differs per profile.
-	includePaddles, shareBit := x.buttonLayout()
+	// Button packing matches real Xbox BLE descriptor (Model 1914):
+	// Btn1=A, Btn2=B, Btn3=X, Btn4=Y, Btn5=LB, Btn6=RB, Btn7=View,
+	// Btn8=Menu, Btn9=LThumb, Btn10=RThumb, Btn11=Guide, Btn12=unused.
+	// Bits 12-15 = padding, Bit 16 = CC Record (Share).
+	includePaddles := x.buttonLayout()
 	var bits uint32
 	if s.Buttons&ButtonA != 0 {
 		bits |= 1 << 0
@@ -444,17 +472,17 @@ func (x *XboxElite2) buildXboxInputReport(s InputState) []byte {
 	if s.Buttons&ButtonStart != 0 {
 		bits |= 1 << 7
 	}
-	if s.Buttons&ButtonGuide != 0 {
-		bits |= 1 << 8
-	}
 	if s.Buttons&ButtonLThumb != 0 {
-		bits |= 1 << 9
+		bits |= 1 << 8 // Btn9
 	}
 	if s.Buttons&ButtonRThumb != 0 {
-		bits |= 1 << 10
+		bits |= 1 << 9 // Btn10
+	}
+	if s.Buttons&ButtonGuide != 0 {
+		bits |= 1 << 10 // Btn11
 	}
 	if includePaddles {
-		// Paddles use the HHD/InputPlumber order: P2,P1,P4,P3.
+		// Paddles use the HHD/InputPlumber order: P2,P1,P4,P3 → Btn12-15.
 		if s.Buttons&ButtonP2 != 0 {
 			bits |= 1 << 11
 		}
@@ -468,96 +496,15 @@ func (x *XboxElite2) buildXboxInputReport(s InputState) []byte {
 			bits |= 1 << 14
 		}
 	}
-	if shareBit >= 0 && s.Reserved&ReservedShare != 0 {
-		bits |= 1 << shareBit
+	// Bit 15 = padding (always 0).
+	// Bit 16 = Consumer Control Record (Share).
+	if s.Reserved&ReservedShare != 0 {
+		bits |= 1 << 16
 	}
 
 	b[14] = byte(bits & 0xFF)
 	b[15] = byte((bits >> 8) & 0xFF)
 	b[16] = byte((bits >> 16) & 0xFF)
-
-	return b
-}
-
-func (x *XboxElite2) buildSteamDeckInputReport(s InputState) []byte {
-	b := make([]byte, InputReportSizeSteamDeck)
-	b[0] = SteamDeckInputMajorVersion
-	b[1] = SteamDeckInputMinorVersion
-	b[2] = SteamDeckInputReportType
-	b[3] = InputReportSizeSteamDeck
-	binary.LittleEndian.PutUint32(b[4:8], atomic.AddUint32(&x.frame, 1))
-
-	setBit := func(byteIndex int, bit uint8, on bool) {
-		if on {
-			// Steam Deck button bytes are specified with msb0 bit numbering
-			// (bit 0 is 0x80, bit 7 is 0x01).
-			if bit < 8 {
-				b[byteIndex] |= 1 << (7 - bit)
-			}
-		}
-	}
-
-	// Byte 8
-	setBit(8, 0, s.Buttons&ButtonA != 0)
-	setBit(8, 1, s.Buttons&ButtonX != 0)
-	setBit(8, 2, s.Buttons&ButtonB != 0)
-	setBit(8, 3, s.Buttons&ButtonY != 0)
-	setBit(8, 4, s.Buttons&ButtonLB != 0)
-	setBit(8, 5, s.Buttons&ButtonRB != 0)
-	// Match SteamDeck target behavior: digital trigger bits should only activate
-	// close to full pull to avoid noisy analog jitter being interpreted as button chords.
-	const steamDigitalTriggerThreshold = 204 // ~80% of 255
-	setBit(8, 6, s.LT >= steamDigitalTriggerThreshold)
-	setBit(8, 7, s.RT >= steamDigitalTriggerThreshold)
-
-	// Byte 9
-	setBit(9, 0, s.Buttons&ButtonP2 != 0) // L5
-	setBit(9, 1, s.Buttons&ButtonStart != 0) // menu
-	setBit(9, 2, s.Buttons&ButtonGuide != 0) // steam
-	setBit(9, 3, s.Buttons&ButtonBack != 0) // options
-	setBit(9, 4, s.DPad&DPadDown != 0)
-	setBit(9, 5, s.DPad&DPadLeft != 0)
-	setBit(9, 6, s.DPad&DPadRight != 0)
-	setBit(9, 7, s.DPad&DPadUp != 0)
-
-	// Byte 10 / 11 / 13 / 14
-	setBit(10, 1, s.Buttons&ButtonLThumb != 0)
-	setBit(10, 3, s.TouchFlags&TouchFlagRightPadTouch != 0) // r_pad_touch
-	setBit(10, 5, s.TouchFlags&TouchFlagRightPadPress != 0) // r_pad_press
-	setBit(10, 7, s.Buttons&ButtonP1 != 0) // R5
-	setBit(11, 5, s.Buttons&ButtonRThumb != 0)
-	setBit(13, 5, s.Buttons&ButtonP3 != 0) // R4
-	setBit(13, 6, s.Buttons&ButtonP4 != 0) // L4
-	setBit(14, 5, s.Reserved&ReservedShare != 0) // quick_access
-
-	// Right touchpad coordinates (signed i16, Steam format).
-	binary.LittleEndian.PutUint16(b[20:22], uint16(s.RPadX))
-	binary.LittleEndian.PutUint16(b[22:24], uint16(s.RPadY))
-
-	// Analog triggers (0..32767 on Deck reports)
-	binary.LittleEndian.PutUint16(b[44:46], uint16(s.LT)*128)
-	binary.LittleEndian.PutUint16(b[46:48], uint16(s.RT)*128)
-
-	// IMU (raw i16 values).
-	binary.LittleEndian.PutUint16(b[24:26], uint16(s.AccelX))
-	binary.LittleEndian.PutUint16(b[26:28], uint16(s.AccelY))
-	binary.LittleEndian.PutUint16(b[28:30], uint16(s.AccelZ))
-	binary.LittleEndian.PutUint16(b[30:32], uint16(s.GyroX)) // pitch
-	binary.LittleEndian.PutUint16(b[32:34], uint16(s.GyroY)) // yaw
-	binary.LittleEndian.PutUint16(b[34:36], uint16(s.GyroZ)) // roll
-
-	// Sticks.
-	binary.LittleEndian.PutUint16(b[48:50], uint16(s.LX))
-	binary.LittleEndian.PutUint16(b[50:52], uint16(s.LY))
-	binary.LittleEndian.PutUint16(b[52:54], uint16(s.RX))
-	binary.LittleEndian.PutUint16(b[54:56], uint16(s.RY))
-
-	// Right touchpad force.
-	rPadForce := s.RPadForce
-	if rPadForce > 32767 {
-		rPadForce = 32767
-	}
-	binary.LittleEndian.PutUint16(b[58:60], rPadForce)
 
 	return b
 }
