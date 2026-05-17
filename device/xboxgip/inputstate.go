@@ -8,7 +8,15 @@ import (
 // InputState is the wire format received from C# (same 20-byte layout as xbox360).
 // Go remaps buttons and scales triggers when building the GIP report.
 //
-// viiper:wire xboxgip c2s buttons:u32 lt:u8 rt:u8 lx:i16 ly:i16 rx:i16 ry:i16 reserved:u8*6
+// Reserved-byte allocation (helper → libviiper extensions):
+//   Reserved[0] = Elite 2 paddle byte (P1=0x01, P2=0x02, P3=0x04, P4=0x08)
+//                 sent inline in 46-byte input report when PID is 0x0B00.
+//   Reserved[1] = Elite 2 paddle "mode" byte (0 = paddles unmapped /
+//                 forwarded as paddle events; non-zero = mapped, SDL
+//                 suppresses to avoid double-fire with re-mapped buttons).
+//   Reserved[2..5] = unused (zero).
+//
+// viiper:wire xboxgip c2s buttons:u32 lt:u8 rt:u8 lx:i16 ly:i16 rx:i16 ry:i16 paddles:u8 paddleMode:u8 _:u8*4
 type InputState struct {
 	Buttons  uint32
 	LT, RT   uint8
@@ -16,6 +24,12 @@ type InputState struct {
 	RX, RY   int16
 	Reserved [6]byte
 }
+
+// Paddles returns the Elite 2 paddle bitmap stored in Reserved[0].
+func (s *InputState) Paddles() byte { return s.Reserved[0] }
+
+// PaddleMode returns the Elite 2 paddle mode flag stored in Reserved[1].
+func (s *InputState) PaddleMode() byte { return s.Reserved[1] }
 
 // UnmarshalBinary decodes 20 bytes into InputState.
 func (s *InputState) UnmarshalBinary(data []byte) error {

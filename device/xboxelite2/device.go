@@ -190,12 +190,14 @@ func (x *XboxElite2) applyProfileDefaults(profile string) {
 }
 
 func (x *XboxElite2) buttonLayout() (includePaddles bool) {
-	switch x.profile {
-	case ProfileXboxOne, ProfileXboxSeries:
-		return false
-	default:
-		return true
-	}
+	// 2026-05-16: paddle slots removed from the HID descriptor across all
+	// xbox profiles to restore xinputhid.sys binding (Microsoft's HID-to-
+	// XInput translator only binds when the descriptor matches the Xbox
+	// Wireless Controller Model 1914 spec — 12 buttons, no paddles).
+	// Wire format still carries ButtonP1..P4 in InputState.Buttons for any
+	// future non-xinputhid consumer, but they are not written into the
+	// outgoing HID report. See const.go button block comment for context.
+	return false
 }
 
 func (x *XboxElite2) SetOutputCallback(f func(elite2state.OutputState)) {

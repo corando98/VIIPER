@@ -100,3 +100,18 @@ const gipInputPayloadSize = 14
 
 // GIP input report total size: 4-byte header + 14-byte payload = 18 bytes.
 const gipInputReportSize = 18
+
+// helloIntervalMs is the spec-defined Hello retransmit cadence (500 ms) while
+// the device is in Arrival state waiting for the host to issue a metadata
+// request or SetState. Per MS-GIPUSB §2.1.1.2.
+const helloIntervalMs = 500
+
+// assumeActiveDelayMs is the post-attach window we wait for the host to issue
+// a metadata-request (0x04) or SetState (0x05) before assuming the host has
+// already processed our identity from cached metadata and is just waiting for
+// us to drive ourselves into the Active state. Empirically, real Xbox One
+// controllers receive 0x04/0x05 ~30-60s post-enumeration, but USBIP-presented
+// devices appear to never receive them — yet cached PIDs still get downstream
+// rumble (0x09), suggesting the publication path is gated on us reaching
+// Active rather than on the host completing metadata exchange.
+const assumeActiveDelayMs = 1500

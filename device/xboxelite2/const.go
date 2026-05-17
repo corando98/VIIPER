@@ -202,6 +202,17 @@ var xboxBLEHIDDescriptor = func() []byte {
 		0x81, 0x03, // Input (Cnst,Var,Abs) — 4-bit padding
 
 		// --- Buttons 1-12 (12 bits + 4-bit padding) ---
+		// Btn1-Btn11 = A,B,X,Y,LB,RB,View,Menu,LS,RS,Guide. Btn12 unused.
+		// 2026-05-16: reverted from 15-button (P2/P1/P4/P3 at Btn12-15) back
+		// to 12-button because xinputhid.sys stopped binding our virtual
+		// device on Legion Go 2 when the button count diverged from
+		// Microsoft's Xbox Wireless Controller Model 1914 spec. With
+		// xinputhid not bound, our HID "Guide" press never raised the
+		// XInput Guide subtype event Windows Shell Game Bar listens for,
+		// so Game Bar wouldn't open. Restoring the spec-compliant 12-
+		// button layout brings xinputhid binding back at the cost of
+		// surfacing paddles via the descriptor; bind paddles in games via
+		// Steam Input or per-game remap if needed.
 		0x05, 0x09, // Usage Page (Button)
 		0x19, 0x01, // Usage Minimum (Button 1)
 		0x29, 0x0C, // Usage Maximum (Button 12)
@@ -289,7 +300,11 @@ var defaultDescriptor = usb.Descriptor{
 		IDVendor:        DefaultVID,
 		IDProduct:       DefaultPID,
 		// Bump revision so Windows refreshes cached HID capabilities after descriptor changes.
-		BcdDevice:     0x0511,
+		// 0x0513 (2026-05-16): force re-parse + fresh xinputhid binding attempt after
+		// reverting from 15-button back to spec-compliant 12-button descriptor — Legion
+		// Go 2 hosts that cached the 15-button layout from 0x0512 need a new revision
+		// to retry driver matching with the new descriptor shape.
+		BcdDevice:     0x0513,
 		IManufacturer: 0x01,
 		IProduct:      0x02,
 		// Provide a stable serial index to help force clean re-enumeration.
@@ -335,7 +350,7 @@ var defaultDescriptor = usb.Descriptor{
 		},
 	},
 	Strings: map[uint8]string{
-		0: "\x04\x09",
+		0: "Љ", // LangID: en-US (0x0409)
 		1: "Microsoft",
 		2: "Xbox Wireless Controller",
 		3: "VIIPER-XBOX-1914-01",

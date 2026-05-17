@@ -141,7 +141,7 @@ const (
 	// USB configuration values
 	usbConfigValueDefault   = 1
 	usbConfigAttrBusPowered = 0xA0 // Bus-powered + remote wakeup (MS-GIPUSB §2.2.3)
-	usbConfigMaxPower100mA  = 50 // In units of 2mA
+	usbConfigMaxPower100mA  = 50   // In units of 2mA
 
 	// URB header field offsets
 	urbHdrSize          = 0x30
@@ -436,10 +436,10 @@ func (s *Server) handleDevList(conn net.Conn) error {
 			BDeviceProtocol:     desc.Device.BDeviceProtocol,
 			BConfigurationValue: usbConfigValueDefault,
 			BNumConfigurations:  desc.Device.BNumConfigurations,
-			BNumInterfaces:      uint8(len(desc.Interfaces)),
+			BNumInterfaces:      interfaceCount(desc.Interfaces),
 		}
 
-		for _, iface := range desc.Interfaces {
+		for _, iface := range usbipInterfaceDescs(desc.Interfaces) {
 			exp.Interfaces = append(exp.Interfaces, usbip.InterfaceDesc{
 				Class:    iface.Descriptor.BInterfaceClass,
 				SubClass: iface.Descriptor.BInterfaceSubClass,
@@ -492,9 +492,9 @@ func (s *Server) handleImport(conn net.Conn, first8 []byte) (usb.Device, error) 
 		BDeviceProtocol:     chosenDesc.Device.BDeviceProtocol,
 		BConfigurationValue: usbConfigValueDefault,
 		BNumConfigurations:  chosenDesc.Device.BNumConfigurations,
-		BNumInterfaces:      uint8(len(chosenDesc.Interfaces)),
+		BNumInterfaces:      interfaceCount(chosenDesc.Interfaces),
 	}
-	for _, iface := range chosenDesc.Interfaces {
+	for _, iface := range usbipInterfaceDescs(chosenDesc.Interfaces) {
 		exp.Interfaces = append(exp.Interfaces, usbip.InterfaceDesc{
 			Class:    iface.Descriptor.BInterfaceClass,
 			SubClass: iface.Descriptor.BInterfaceSubClass,
@@ -840,7 +840,7 @@ func (s *Server) buildConfigDescriptor(desc *usb.Descriptor) []byte {
 	var b bytes.Buffer
 	h := usb.ConfigHeader{
 		WTotalLength:        0, // to be patched
-		BNumInterfaces:      uint8(len(desc.Interfaces)),
+		BNumInterfaces:      interfaceCount(desc.Interfaces),
 		BConfigurationValue: usbConfigValueDefault,
 		IConfiguration:      0,
 		BMAttributes:        usbConfigAttrBusPowered,
@@ -869,4 +869,26 @@ func (s *Server) buildConfigDescriptor(desc *usb.Descriptor) []byte {
 	data := b.Bytes()
 	binary.LittleEndian.PutUint16(data[2:4], uint16(len(data)))
 	return data
+}
+
+func interfaceCount(interfaces []usb.InterfaceConfig) uint8 {
+	seen := make(map[uint8]struct{}, len(interfaces))
+	for _, iface := range interfaces {
+		seen[iface.Descriptor.BInterfaceNumber] = struct{}{}
+	}
+	return uint8(len(seen))
+}
+
+func usbipInterfaceDescs(interfaces []usb.InterfaceConfig) []usb.InterfaceConfig {
+	out := make([]usb.InterfaceConfig, 0, len(interfaces))
+	seen := make(map[uint8]struct{}, len(interfaces))
+	for _, iface := range interfaces {
+		n := iface.Descriptor.BInterfaceNumber
+		if _, ok := seen[n]; ok {
+			continue
+		}
+		seen[n] = struct{}{}
+		out = append(out, iface)
+	}
+	return out
 }
