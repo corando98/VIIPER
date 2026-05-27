@@ -51,6 +51,13 @@ func buildMetadataBlob() []byte {
 		guidNavigationController,
 		guidDevAuthPCOptOut,
 		guidEliteButtons,
+		// Test D (dropping guidEliteButtons + changing fw to 2.5) BROKE the
+		// bridge fast-path match for PID 0x02D1 — host no longer fired
+		// Quiesce, just 3 metadata retries then STOP. Reverted to Test C
+		// state (5.21 fw + EliteButtons): that reliably reaches Quiesce +
+		// Active + first input report, then STOPs at cycle 3 post-Active.
+		// Cycle-3 post-Active STOP is a different problem from bridge
+		// matching and needs a different angle.
 		// IVirtualDevice intentionally OMITTED for USB transport. Per Ghidra
 		// disassembly of xboxgip.sys FUN_140024720 (the metadata-arrival
 		// handler), the post-parse predicate is:
@@ -70,9 +77,15 @@ func buildMetadataBlob() []byte {
 	capsIn := []byte{0x01, 0x04, 0x05, 0x06, 0x07, 0x0C, 0x0A}
 	className := "Windows.Xbox.Input.Gamepad"
 	type fwVer struct{ major, minor uint16 }
-	// Firmware 5.21 — must match buildHelloMessage. Real Elite 2 firmware
-	// revision (XBE2_5 paddle layout) so any cached Windows metadata for
-	// this VID/PID/FW tuple matches.
+	// Firmware 5.21 — matches the Elite 2 paddle-firmware revision the
+	// Linux kernel's XBE2_5 layout expects. Production default.
+	//
+	// 2026-05-19: this value doesn't really matter — xboxgip target was
+	// pulled from the widget after RE confirmed no USB-IP virtual gamepad
+	// can publish an IGamepad PDO through xboxgip.sys (see
+	// [[project_gip_definitive_walls_2026-05-19]]). Kept the appendGIPLen2
+	// encoding fix in fragmentMetadata + buildMetadataComplete since that
+	// IS a real protocol bug that affected all GIP traffic.
 	firmware := []fwVer{{5, 21}}
 	type message struct {
 		marker, cmd, length, opt2, options byte
@@ -191,7 +204,7 @@ var extCompatIDDescriptor = [40]byte{
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // reserved
 	// Function section (24 bytes)
 	0x00,                                           // bFirstInterfaceNumber = 0
-	0x02,                                           // bNumInterfaces = 2 (data + audio interface)
+	0x02,                                           // bNumInterfaces = 2 (data + bulk expansion — audio dropped in Test A)
 	0x58, 0x47, 0x49, 0x50, 0x31, 0x30, 0x00, 0x00, // compatibleID = "XGIP10\0\0"
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // subCompatibleID = "\0\0\0\0\0\0\0\0"
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // reserved
@@ -242,12 +255,10 @@ func buildHelloMessage(seq uint8, vid, pid uint16) []byte {
 	binary.LittleEndian.PutUint16(msg[12:14], vid)
 	binary.LittleEndian.PutUint16(msg[14:16], pid)
 
-	// Firmware version 5.21 — matches the firmware revision the kernel's
-	// XBE2_5 paddle layout expects (per xbox_gip.c gip_enable_elite_buttons)
-	// AND was the previously-cached firmware that produced REAL EP1 OUT
-	// traffic (rumble 0x09 + Elite-specific 0x0E) from Windows. We're using
-	// 2269 as the "go back to the only state Windows ever talked to us in"
-	// wedge, so we match the cached path exactly.
+	// Firmware 5.21 — Elite 2 firmware revision the kernel's XBE2_5 paddle
+	// layout expects (per xbox_gip.c gip_enable_elite_buttons). Production
+	// default. See [[project_gip_definitive_walls_2026-05-19]] for why
+	// the xboxgip target ultimately can't publish a child PDO over USB-IP.
 	binary.LittleEndian.PutUint16(msg[16:18], 5)  // major
 	binary.LittleEndian.PutUint16(msg[18:20], 21) // minor
 	binary.LittleEndian.PutUint16(msg[20:22], 0)  // build
@@ -321,6 +332,24 @@ func appendGIPLEB128(dst []byte, v int) []byte {
 	}
 }
 
+// appendGIPLen2 writes a value using a forced 2-byte 7-bit-extended
+// encoding (low byte with bit 7 set, high byte 0). Required for GIP
+// Total Length and fragment Offset fields per MS-GIPUSB — those fields
+// have a fixed 2-byte width regardless of value magnitude. Using
+// variable-width LEB128 (single byte when v < 128) causes the host's
+// parser to consume the following byte as the offset's high part,
+// landing on bogus offsets and dropping the fragment.
+//
+// 2026-05-19: confirmed by host-side ACK trace — sending fragment 2
+// with offset 58 as the single byte 0x3A made the host parse offset
+// as 58 + (data[0] << 7) ~= 2106, far past the blob end. Fragments
+// 2-4 silently rejected; ACK reported "received 58 of 216 bytes".
+func appendGIPLen2(dst []byte, v int) []byte {
+	lo := byte(0x80 | (v & 0x7F))
+	hi := byte((v >> 7) & 0x7F)
+	return append(dst, lo, hi)
+}
+
 // fragmentMetadata splits the metadata blob into GIP fragmented
 // packets for transport over the 64-byte interrupt endpoint.
 // Each fragment is a complete GIP packet ready for EP IN.
@@ -341,16 +370,20 @@ func fragmentMetadata(seq uint8) [][]byte {
 		header = append(header, GIPDescriptor)
 
 		if first {
-			// First fragment: Fragment + InitFrag + System + ACME
+			// First fragment: Fragment + InitFrag + System + ACME.
+			// Total Length is a forced 2-byte field; see appendGIPLen2.
 			header = append(header,
 				GIPFlagFragment|GIPFlagInitFrag|GIPFlagSystem|GIPFlagACME, // 0xF0
 				seq,
 				byte(payloadSize), // this fragment's payload length
 			)
-			header = appendGIPLEB128(header, total)
+			header = appendGIPLen2(header, total)
 			first = false
 		} else {
-			// Subsequent fragments: Fragment + System (+ ACME on last)
+			// Subsequent fragments: Fragment + System (+ ACME on last).
+			// Fragment Offset is a forced 2-byte field — variable-width
+			// LEB128 would let the host pull data bytes into the offset
+			// field for offsets < 128 (verified via ACK trace 2026-05-19).
 			flags := byte(GIPFlagFragment | GIPFlagSystem) // 0xA0
 			if offset+payloadSize >= total {
 				flags |= GIPFlagACME // final fragment needs ACK
@@ -360,7 +393,7 @@ func fragmentMetadata(seq uint8) [][]byte {
 				seq, // same sequence as first fragment
 				byte(payloadSize),
 			)
-			header = appendGIPLEB128(header, offset)
+			header = appendGIPLen2(header, offset)
 		}
 
 		pkt := make([]byte, len(header)+payloadSize)
@@ -392,7 +425,7 @@ func buildMetadataComplete(seq uint8, totalLen int) []byte {
 		seq,                             // same seq as the data fragments
 		0x00,                            // zero payload
 	}
-	pkt = appendGIPLEB128(pkt, totalLen)
+	pkt = appendGIPLen2(pkt, totalLen)
 	return pkt
 }
 

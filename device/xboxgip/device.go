@@ -231,6 +231,22 @@ func (d *XboxGIP) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
 		}
 		return []byte{0x00}
 	}
+	// EP3 (interface 2 alt 1 — bulk expansion channel). Real wired Xbox
+	// One controllers expose this for chatpad data (older bodies) or the
+	// Microsoft auth challenge/response (Elite Series 2). We can't sign
+	// the auth challenge without Microsoft's keys, and we don't emulate
+	// a chatpad, so the host just sees empty bulk traffic. The point of
+	// the interface being present is to match real-controller descriptor
+	// shape — xboxgip.sys appears to gate IGamepad publication on the
+	// full 3-interface configuration showing up at enumeration time.
+	if dir == usbip.DirOut && ep == 3 {
+		d.logf("EP3 OUT (iface 2 bulk): len=%d hex=%X", len(out), out)
+		return nil
+	}
+	if dir == usbip.DirIn && ep == 3 {
+		// Silent NAK. Real chatpad/auth would return signed bytes here.
+		return []byte{0x00}
+	}
 	return nil
 }
 
@@ -811,7 +827,9 @@ func makeDescriptor() usb.Descriptor {
 			Speed:              2, // Full-speed (12 Mbps) — MS-GIPUSB spec §2.2.1 requires FS; MUST STALL device_qualifier
 		},
 		Interfaces: []usb.InterfaceConfig{
-			// Interface 0: GIP data.
+			// Interface 0: GIP data — gamepad input/output, paddles, profile
+			// state. bInterfaceProtocol 0xD0 matches the MS-GIPUSB spec's
+			// "GIP data" protocol byte.
 			{
 				Descriptor: usb.InterfaceDescriptor{
 					BInterfaceNumber:   0x00,
@@ -827,9 +845,16 @@ func makeDescriptor() usb.Descriptor {
 					{BEndpointAddress: 0x01, BMAttributes: 0x03, WMaxPacketSize: 0x0040, BInterval: 0x04},
 				},
 			},
-			// Interface 1: GIP audio alt 0. The metadata advertises no audio
-			// formats, but real wired GIP controllers still expose the audio
-			// interface shape for headset-capable hardware.
+			// Interface 1 alt 0: bulk expansion channel, inactive shape.
+			// Diagnostic build (TEST A): audio interface removed so the
+			// host does NOT classify us as audio-capable. MS-GIPUSB audio
+			// startup sequence is Hello → metadata → STOP → Audio Control
+			// Config → device replies → START; without an Audio Format
+			// declared in metadata, dc1-controller sends STOP and then
+			// stalls indefinitely (verified in helper xboxgip_debug.log).
+			// Stripping the audio interface forces the non-audio startup
+			// path: Hello → metadata → START. If START fires, we know
+			// audio negotiation was the blocker.
 			{
 				Descriptor: usb.InterfaceDescriptor{
 					BInterfaceNumber:   0x01,
@@ -841,9 +866,10 @@ func makeDescriptor() usb.Descriptor {
 					IInterface:         0x00,
 				},
 			},
-			// Interface 1: GIP audio alt 1. Endpoints are the MS-GIPUSB
-			// isochronous audio endpoints; they should stay idle while the
-			// metadata audio-format section remains empty.
+			// Interface 1 alt 1: bulk expansion endpoints. EP 0x03 OUT /
+			// 0x83 IN — chatpad / auth-channel endpoint addresses (kept
+			// from the prior 3-interface design at addresses 0x03/0x83
+			// so HandleTransfer's existing EP3 routing still works).
 			{
 				Descriptor: usb.InterfaceDescriptor{
 					BInterfaceNumber:   0x01,
@@ -855,8 +881,8 @@ func makeDescriptor() usb.Descriptor {
 					IInterface:         0x00,
 				},
 				Endpoints: []usb.EndpointDescriptor{
-					{BEndpointAddress: 0x02, BMAttributes: 0x01, WMaxPacketSize: 0x00E4, BInterval: 0x01},
-					{BEndpointAddress: 0x82, BMAttributes: 0x01, WMaxPacketSize: 0x0040, BInterval: 0x01},
+					{BEndpointAddress: 0x03, BMAttributes: 0x02, WMaxPacketSize: 0x0040, BInterval: 0x00},
+					{BEndpointAddress: 0x83, BMAttributes: 0x02, WMaxPacketSize: 0x0040, BInterval: 0x00},
 				},
 			},
 		},
