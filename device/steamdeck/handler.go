@@ -1,0 +1,71 @@
+package steamdeck
+
+import (
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+
+	"github.com/Alia5/VIIPER/device"
+	"github.com/Alia5/VIIPER/internal/server/api"
+	"github.com/Alia5/VIIPER/usb"
+)
+
+func init() {
+	api.RegisterDevice(DefaultProfile, &handler{profile: DefaultProfile})
+}
+
+type handler struct{ profile string }
+
+func (h *handler) CreateDevice(o *device.CreateOptions) (usb.Device, error) {
+	if o == nil {
+		o = &device.CreateOptions{}
+	}
+	if o.DeviceSpecific == nil {
+		o.DeviceSpecific = map[string]any{}
+	}
+	if _, ok := o.DeviceSpecific["profile"]; !ok {
+		o.DeviceSpecific["profile"] = h.profile
+	}
+	return New(o)
+}
+
+func (h *handler) StreamHandler() api.StreamHandlerFunc {
+	return func(conn net.Conn, devPtr *usb.Device, logger *slog.Logger) error {
+		if devPtr == nil || *devPtr == nil {
+			return fmt.Errorf("nil device")
+		}
+		deck, ok := (*devPtr).(*SteamDeck)
+		if !ok {
+			return fmt.Errorf("device is not steamdeck")
+		}
+
+		deck.SetOutputCallback(func(feedback OutputState) {
+			data, err := feedback.MarshalBinary()
+			if err != nil {
+				logger.Error("failed to marshal feedback", "error", err)
+				return
+			}
+			if _, err := conn.Write(data); err != nil {
+				logger.Error("failed to send feedback", "error", err)
+			}
+		})
+
+		buf := make([]byte, InputReportLen)
+		for {
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				if err == io.EOF {
+					logger.Info("client disconnected")
+					return nil
+				}
+				return fmt.Errorf("read input state: %w", err)
+			}
+
+			var state InputState
+			if err := state.UnmarshalBinary(buf); err != nil {
+				return fmt.Errorf("unmarshal input state: %w", err)
+			}
+			deck.UpdateInputState(&state)
+		}
+	}
+}
