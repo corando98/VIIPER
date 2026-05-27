@@ -1,142 +1,153 @@
-// Package steamcontroller emulates the Valve Steam Controller family
-// (Steam Deck and the broader 0x28DE generic-handheld PID space used by
-// Steam Input on third-party devices such as MSI Claw, ROG Ally, Zotac
-// Zone, and Lenovo Legion Go / Legion Go S / Legion Go 2).
-//
-// Steam targets share the InputState wire format defined in
-// internal/inputstate/elite2 with the xboxelite2 package
-// (gyro + accel + right touchpad live in bytes 14..32). Xbox
-// targets simply ignore those bytes; Steam targets pack them into the
-// vendor-defined 64-byte Steam Deck input report.
 package steamcontroller
 
-import "github.com/Alia5/VIIPER/usb"
-
 const (
-	// DefaultVIDSteam is Valve Corporation.
-	DefaultVIDSteam uint16 = 0x28DE
-
-	// Default PIDs Steam Input recognises as a "Steam Controller" family.
-	// 0x1205 is the real Steam Deck; the 0x12Fx range was carved out for
-	// third-party handhelds shipping with Steam Input support.
-	DefaultPIDSteamDeck            uint16 = 0x1205
-	DefaultPIDSteamGeneric         uint16 = 0x12F0
-	DefaultPIDSteamMsiClaw         uint16 = 0x12FA
-	DefaultPIDSteamLenovoLegionGo2 uint16 = 0x12FB
-	DefaultPIDSteamZotacZone       uint16 = 0x12FC
-	DefaultPIDSteamAsusRogAlly     uint16 = 0x12FD
-	DefaultPIDSteamLenovoLegionGo  uint16 = 0x12FE
-	DefaultPIDSteamLenovoLegionGoS uint16 = 0x12FF
+	DefaultVID = 0x28de
+	DefaultPID = 0x1102
 )
 
 const (
-	EndpointIn  = 0x81
-	EndpointOut = 0x01
+	InputReportID   = 0x01
+	InputReportLen  = 64
+	InputPayloadLen = 60
 )
 
 const (
-	// Steam Deck-style vendor input/output report identifiers.
-	SteamDeckInputMajorVersion = 0x01
-	SteamDeckInputMinorVersion = 0x00
-	SteamDeckInputReportType   = 0x09
-	SteamDeckRumbleCommandType = 0xEB
-
-	// Steam Deck vendor input/output reports are 64 bytes.
-	InputReportSizeSteamDeck  = 64
-	OutputReportSizeSteamDeck = 64
+	FeatureSetDigitalMappings   = 0x80
+	FeatureClearDigitalMappings = 0x81
+	FeatureGetDigitalMappings   = 0x82
+	FeatureGetAttributesValues  = 0x83
+	FeatureGetAttributeLabel    = 0x84
+	FeatureSetDefaultMappings   = 0x85
+	FeatureFactoryReset         = 0x86
+	FeatureSetSettingsValues    = 0x87
+	FeatureClearSettingsValues  = 0x88
+	FeatureGetSettingsValues    = 0x89
+	FeatureGetSettingLabel      = 0x8a
+	FeatureGetSettingsMaxs      = 0x8b
+	FeatureGetSettingsDefaults  = 0x8c
+	FeatureSetControllerMode    = 0x8d
+	FeatureLoadDefaultSettings  = 0x8e
+	FeatureTriggerHapticPulse   = 0x8f
+	FeatureTurnOffController    = 0x9f
+	FeatureGetDeviceInfo        = 0xa1
+	FeatureGetStringAttribute   = 0xae
+	FeatureRadioEraseRecords    = 0xaf
+	FeatureRadioWriteRecord     = 0xb0
+	FeatureSetDongleSetting     = 0xb1
+	FeatureDongleDisconnect     = 0xb2
+	FeatureDongleCommitDevice   = 0xb3
+	FeatureGetWirelessState     = 0xb4
+	FeatureCalibrateGyro        = 0xb5
+	FeaturePlayAudio            = 0xb6
+	FeatureAudioUpdateStart     = 0xb7
+	FeatureAudioUpdateData      = 0xb8
+	FeatureAudioUpdateComplete  = 0xb9
+	FeatureGetChipID            = 0xba
+	FeatureResetIMU             = 0xce
+	FeatureTriggerHapticCommand = 0xea
+	FeatureTriggerRumbleCommand = 0xeb
 )
 
-// Profile identifiers for the Steam Controller family.
 const (
-	ProfileSteamDeck    = "steamdeck"
-	ProfileSteamGeneric = "steamdeck-generic"
+	AttributeUniqueID             = 0x00
+	AttributeProductID            = 0x01
+	AttributeCapabilities         = 0x02
+	AttributeFirmwareBuildTime    = 0x04
+	AttributeBoardRevision        = 0x09
+	AttributeConnectionIntervalUs = 0x0b
 )
 
-// steamDeckControllerHIDDescriptor mirrors InputPlumber / HID captures of
-// the real Steam Deck controller. It is a vendor-defined collection that
-// carries 64-byte input and 64-byte feature reports — Steam Input parses
-// the payload itself, the HID descriptor only declares the byte stream.
-var steamDeckControllerHIDDescriptor = []byte{
-	0x06, 0xff, 0xff, // Usage Page (Vendor Usage Page 0xffff)
-	0x09, 0x01, // Usage (Vendor Usage 0x01)
-	0xa1, 0x01, // Collection (Application)
-	0x09, 0x02, //  Usage (Vendor Usage 0x02)
-	0x09, 0x03, //  Usage (Vendor Usage 0x03)
-	0x15, 0x00, //  Logical Minimum (0)
-	0x26, 0xff, 0x00, //  Logical Maximum (255)
-	0x75, 0x08, //  Report Size (8)
-	0x95, 0x40, //  Report Count (64)
-	0x81, 0x02, //  Input (Data,Var,Abs)
-	0x09, 0x06, //  Usage (Vendor Usage 0x06)
-	0x09, 0x07, //  Usage (Vendor Usage 0x07)
-	0x15, 0x00, //  Logical Minimum (0)
-	0x26, 0xff, 0x00, //  Logical Maximum (255)
-	0x75, 0x08, //  Report Size (8)
-	0x95, 0x40, //  Report Count (64)
-	0xb1, 0x02, //  Feature (Data,Var,Abs)
-	0xc0, // End Collection
-}
+const (
+	StringAttributeBoardSerial = 0x00
+	StringAttributeUnitSerial  = 0x01
+)
 
-// defaultDescriptor is the baseline USB descriptor before profile-specific
-// overrides are applied (VID/PID/strings). All Steam profiles use the same
-// vendor HID descriptor and 64-byte endpoint packet size.
-var defaultDescriptor = usb.Descriptor{
-	Device: usb.DeviceDescriptor{
-		BcdUSB:             0x0200,
-		BDeviceClass:       0x00,
-		BDeviceSubClass:    0x00,
-		BDeviceProtocol:    0x00,
-		BMaxPacketSize0:    0x40,
-		IDVendor:           DefaultVIDSteam,
-		IDProduct:          DefaultPIDSteamDeck,
-		BcdDevice:          0x0509,
-		IManufacturer:      0x01,
-		IProduct:           0x02,
-		ISerialNumber:      0x03,
-		BNumConfigurations: 0x01,
-		Speed:              2, // Full speed
-	},
-	Interfaces: []usb.InterfaceConfig{
-		{
-			Descriptor: usb.InterfaceDescriptor{
-				BInterfaceNumber:   0x00,
-				BAlternateSetting:  0x00,
-				BNumEndpoints:      0x02,
-				BInterfaceClass:    0x03, // HID
-				BInterfaceSubClass: 0x00,
-				BInterfaceProtocol: 0x00,
-				IInterface:         0x00,
-			},
-			HID: &usb.HIDFunction{
-				Descriptor: usb.HIDDescriptor{
-					BcdHID:       0x0111,
-					BCountryCode: 0x00,
-					Descriptors: []usb.HIDSubDescriptor{
-						{Type: usb.ReportDescType},
-					},
-				},
-				ReportRaw: steamDeckControllerHIDDescriptor,
-			},
-			Endpoints: []usb.EndpointDescriptor{
-				{
-					BEndpointAddress: EndpointIn,
-					BMAttributes:     0x03, // Interrupt
-					WMaxPacketSize:   64,
-					BInterval:        4, // 4ms = 250Hz
-				},
-				{
-					BEndpointAddress: EndpointOut,
-					BMAttributes:     0x03, // Interrupt
-					WMaxPacketSize:   64,
-					BInterval:        4,
-				},
-			},
-		},
-	},
-	Strings: map[uint8]string{
-		0: "\x04\x09",
-		1: "Valve Software",
-		2: "Steam Deck Controller",
-		3: "VIIPER-SD-05",
-	},
-}
+const (
+	SettingLeftTrackpadMode    = 0x07
+	SettingRightTrackpadMode   = 0x08
+	SettingLizardMode          = 0x09
+	SettingSmoothAbsoluteMouse = 0x18
+	SettingEnableRawJoystick   = 0x2e
+	SettingEnableFastScan      = 0x2f
+	SettingIMUMode             = 0x30
+	SettingWirelessPacketVer   = 0x31
+)
+
+const (
+	GyroModeOff             = 0x00
+	GyroModeSteering        = 0x01
+	GyroModeTilt            = 0x02
+	GyroModeSendOrientation = 0x04
+	GyroModeSendRawAccel    = 0x08
+	GyroModeSendRawGyro     = 0x10
+)
+
+const (
+	TrackpadModeAbsoluteMouse = 0x00
+	TrackpadModeNone          = 0x07
+)
+
+const (
+	LizardModeOff = 0x00
+	LizardModeOn  = 0x01
+)
+
+const (
+	CapabilityKeyboard = 0x00000001
+	CapabilityMouse    = 0x00000002
+	CapabilityGamepad  = 0x00000004
+	CapabilityAll      = CapabilityKeyboard | CapabilityMouse | CapabilityGamepad
+)
+
+const (
+	buttonByte8R2 = 0x01
+	buttonByte8L2 = 0x02
+	buttonByte8R1 = 0x04
+	buttonByte8L1 = 0x08
+	buttonByte8Y  = 0x10
+	buttonByte8B  = 0x20
+	buttonByte8X  = 0x40
+	buttonByte8A  = 0x80
+
+	buttonByte9Up      = 0x01
+	buttonByte9Right   = 0x02
+	buttonByte9Left    = 0x04
+	buttonByte9Down    = 0x08
+	buttonByte9Menu    = 0x10
+	buttonByte9Steam   = 0x20
+	buttonByte9Options = 0x40
+	buttonByte9LGrip   = 0x80
+
+	buttonByte10RGrip      = 0x01
+	buttonByte10LPadPress  = 0x02
+	buttonByte10RPadPress  = 0x04
+	buttonByte10LPadTouch  = 0x08
+	buttonByte10RPadTouch  = 0x10
+	buttonByte10L3         = 0x40
+	buttonByte10LPadAndJoy = 0x80
+)
+
+const (
+	CommandTypeOff   = 0
+	CommandTypeTick  = 1
+	CommandTypeClick = 2
+)
+
+const (
+	PadSideLeft  = 0
+	PadSideRight = 1
+	PadSideBoth  = 2
+)
+
+const (
+	IntensityDefault = 0
+	IntensityShort   = 1
+	IntensityMedium  = 2
+	IntensityLong    = 3
+	IntensityInsane  = 4
+)
+
+const (
+	DefaultBatteryMilliVolts = 3000
+	MaxAnalogTriggerRaw      = 26000
+)

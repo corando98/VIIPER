@@ -2,91 +2,136 @@ package steamcontroller
 
 import (
 	"encoding/binary"
-	"encoding/json"
-	"fmt"
-	"log/slog"
-	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/Alia5/VIIPER/device"
-	"github.com/Alia5/VIIPER/device/xboxelite2"
-	elite2state "github.com/Alia5/VIIPER/internal/inputstate/elite2"
 	"github.com/Alia5/VIIPER/usb"
+	"github.com/Alia5/VIIPER/usb/hid"
 	"github.com/Alia5/VIIPER/usbip"
 )
 
-// SteamController emulates a Valve Steam Controller-family device over
-// USBIP. The wire input format is the shared Elite-2-derived layout
-// defined in internal/inputstate/elite2 (Xbox profiles ignore the
-// touchpad/IMU tail). The host-facing HID report is the 64-byte Steam
-// Deck vendor input report.
-type SteamController struct {
-	inputState *elite2state.InputState
-	stateMu    sync.Mutex
-	outputFunc func(elite2state.OutputState)
-	descriptor usb.Descriptor
-	profile    string
-	frame      uint32
+const (
+	keyboardInterfaceNumber   = 0x00
+	mouseInterfaceNumber      = 0x01
+	controllerInterfaceNumber = 0x02
 
-	// Steam IMU timing: zero stale gyro during keepalive gaps so the
-	// host doesn't continue rotating when the client stops sending new
-	// frames (this matches the real Deck's behaviour during disconnects).
-	inputVersion  uint32 // bumped in UpdateInputState
-	lastReportedV uint32 // version at last HandleTransfer
-	lastInputNano int64  // UnixNano of last new input data
-	pollCount     int64  // total polls for rate measurement
-	pollLogNano   int64  // start time for rate measurement
+	keyboardEndpointNumber   = 0x01
+	mouseEndpointNumber      = 0x02
+	controllerEndpointNumber = 0x03
+)
+
+var zeroMouseReport = []byte{0x00, 0x00, 0x00, 0x00}
+
+var zeroKeyboardReport = []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+
+// These settings represent the controller's baseline firmware state before Steam
+// applies its open-time reset sequence.
+var firmwareDefaultSettings = map[uint8]uint16{
+	SettingLeftTrackpadMode:    TrackpadModeNone,
+	SettingRightTrackpadMode:   TrackpadModeAbsoluteMouse,
+	SettingLizardMode:          LizardModeOn,
+	SettingSmoothAbsoluteMouse: 1,
+	SettingEnableRawJoystick:   0,
+	SettingEnableFastScan:      0,
+	SettingIMUMode:             GyroModeOff,
+	SettingWirelessPacketVer:   0,
 }
 
-type steamControllerCreateOptions struct {
-	Profile *string `json:"profile"`
+// Steam programs a smaller runtime delta after loading defaults.
+var steamRuntimeSettings = map[uint8]uint16{
+	SettingLeftTrackpadMode:    TrackpadModeNone,
+	SettingRightTrackpadMode:   TrackpadModeNone,
+	SettingLizardMode:          LizardModeOn,
+	SettingSmoothAbsoluteMouse: 0,
+	SettingEnableRawJoystick:   0,
+	SettingEnableFastScan:      0,
+	SettingIMUMode:             GyroModeOff,
+	SettingWirelessPacketVer:   2,
+}
+
+const (
+	hidKeyEscape = 0x29
+	hidKeyEnter  = 0x28
+	hidKeyRight  = 0x4f
+	hidKeyLeft   = 0x50
+	hidKeyDown   = 0x51
+	hidKeyUp     = 0x52
+)
+
+type SteamController struct {
+	inputState          *InputState
+	stateMu             sync.Mutex
+	featureMu           sync.Mutex
+	outputFunc          func(OutputState)
+	frame               uint32
+	descriptor          usb.Descriptor
+	controller          controllerState
+	imuBias             imuBiasState
+	lastFeatureResponse []byte
+}
+
+type controllerState struct {
+	mode         byte
+	digitalMaps  bool
+	settings     map[uint8]uint16
+	boardSerial  string
+	unitSerial   string
+	uniqueID     uint32
+	boardRev     uint32
+	firmwareTime uint32
+}
+
+type imuBiasState struct {
+	valid          bool
+	accelX, accelY int16
+	accelZ         int16
+	gyroX, gyroY   int16
+	gyroZ          int16
+}
+
+var maxSettings = map[uint8]uint16{
+	SettingLeftTrackpadMode:    TrackpadModeNone,
+	SettingRightTrackpadMode:   TrackpadModeNone,
+	SettingLizardMode:          LizardModeOn,
+	SettingSmoothAbsoluteMouse: 1,
+	SettingIMUMode:             GyroModeSteering | GyroModeTilt | GyroModeSendOrientation | GyroModeSendRawAccel | GyroModeSendRawGyro,
+	SettingEnableRawJoystick:   1,
+	SettingEnableFastScan:      1,
+	SettingWirelessPacketVer:   2,
+}
+
+var settingsOrder = []uint8{
+	SettingLeftTrackpadMode,
+	SettingRightTrackpadMode,
+	SettingLizardMode,
+	SettingSmoothAbsoluteMouse,
+	SettingEnableRawJoystick,
+	SettingEnableFastScan,
+	SettingIMUMode,
+	SettingWirelessPacketVer,
+}
+
+func newControllerState() controllerState {
+	return controllerState{
+		settings:     cloneSettings(firmwareDefaultSettings),
+		boardSerial:  "SteamController-0001",
+		unitSerial:   "SteamController-0001",
+		uniqueID:     0x53544354,
+		boardRev:     1,
+		firmwareTime: 0x57bf5c10,
+		mode:         byte(firmwareDefaultSettings[SettingLizardMode]),
+		digitalMaps:  true,
+	}
 }
 
 func New(o *device.CreateOptions) (*SteamController, error) {
 	d := &SteamController{
-		descriptor: cloneDescriptor(defaultDescriptor),
-		profile:    ProfileSteamDeck,
+		descriptor: defaultDescriptor,
+		inputState: &InputState{},
+		controller: newControllerState(),
 	}
-	d.applyProfileDefaults(ProfileSteamDeck)
-	profileExplicit := false
-
-	if o != nil && o.DeviceSpecific != nil {
-		var args steamControllerCreateOptions
-		data, err := json.Marshal(o.DeviceSpecific)
-		if err != nil {
-			return nil, fmt.Errorf("invalid JSON payload: %w", err)
-		}
-		if err := json.Unmarshal(data, &args); err != nil {
-			return nil, fmt.Errorf("invalid JSON payload: %w", err)
-		}
-		if args.Profile != nil {
-			profile, err := parseProfile(*args.Profile)
-			if err != nil {
-				return nil, err
-			}
-			d.applyProfileDefaults(profile)
-			profileExplicit = true
-		}
-	}
-
 	if o != nil {
-		// Older clients may only expose VID/PID overrides.
-		// If no explicit profile was requested, infer profile metadata for known IDs.
-		if !profileExplicit {
-			vid := d.descriptor.Device.IDVendor
-			pid := d.descriptor.Device.IDProduct
-			if o.IdVendor != nil {
-				vid = *o.IdVendor
-			}
-			if o.IdProduct != nil {
-				pid = *o.IdProduct
-			}
-			if inferred, ok := profileForIDs(vid, pid); ok {
-				d.applyProfileDefaults(inferred)
-			}
-		}
 		if o.IdVendor != nil {
 			d.descriptor.Device.IDVendor = *o.IdVendor
 		}
@@ -94,358 +139,600 @@ func New(o *device.CreateOptions) (*SteamController, error) {
 			d.descriptor.Device.IDProduct = *o.IdProduct
 		}
 	}
-
 	return d, nil
 }
 
-func parseProfile(profile string) (string, error) {
-	switch strings.ToLower(strings.TrimSpace(profile)) {
-	case "", ProfileSteamDeck, "steam-deck", "deck", "valve-steamdeck", "1205", "0x1205":
-		return ProfileSteamDeck, nil
-	case ProfileSteamGeneric, "steam-generic", "steam-controller", "deck-uhid", "12f0", "0x12f0":
-		return ProfileSteamGeneric, nil
-	default:
-		return "", fmt.Errorf(
-			"unsupported steamcontroller profile %q (supported: %q, %q)",
-			profile,
-			ProfileSteamDeck,
-			ProfileSteamGeneric,
-		)
-	}
+func (d *SteamController) lizardModeEnabled() bool {
+	return d.controller.digitalMaps && d.controller.settings[SettingLizardMode] != uint16(LizardModeOff)
 }
 
-func profileForIDs(vid, pid uint16) (string, bool) {
-	if vid != DefaultVIDSteam {
-		return "", false
-	}
-	switch pid {
-	case DefaultPIDSteamDeck:
-		return ProfileSteamDeck, true
-	case DefaultPIDSteamGeneric,
-		DefaultPIDSteamMsiClaw,
-		DefaultPIDSteamLenovoLegionGo2,
-		DefaultPIDSteamZotacZone,
-		DefaultPIDSteamAsusRogAlly,
-		DefaultPIDSteamLenovoLegionGo,
-		DefaultPIDSteamLenovoLegionGoS:
-		return ProfileSteamGeneric, true
-	default:
-		return "", false
-	}
+func (d *SteamController) imuMode() uint16 {
+	return d.controller.settings[SettingIMUMode]
 }
 
-func cloneDescriptor(src usb.Descriptor) usb.Descriptor {
-	dst := src
-
-	dst.Interfaces = make([]usb.InterfaceConfig, len(src.Interfaces))
-	copy(dst.Interfaces, src.Interfaces)
-	for i := range src.Interfaces {
-		if src.Interfaces[i].HID != nil {
-			hid := *src.Interfaces[i].HID
-			hid.Descriptor.Descriptors = append([]usb.HIDSubDescriptor(nil), src.Interfaces[i].HID.Descriptor.Descriptors...)
-			hid.ReportRaw = append([]byte(nil), src.Interfaces[i].HID.ReportRaw...)
-			dst.Interfaces[i].HID = &hid
-		}
-		dst.Interfaces[i].Endpoints = append([]usb.EndpointDescriptor(nil), src.Interfaces[i].Endpoints...)
-		dst.Interfaces[i].ClassDescriptors = append([]usb.ClassSpecificDescriptor(nil), src.Interfaces[i].ClassDescriptors...)
+func (d *SteamController) reportedControllerMode() byte {
+	if d.lizardModeEnabled() {
+		return byte(LizardModeOn)
 	}
+	return byte(LizardModeOff)
+}
 
-	dst.Strings = make(map[uint8]string, len(src.Strings))
-	for k, v := range src.Strings {
-		dst.Strings[k] = v
+func (d *SteamController) SetOutputCallback(f func(OutputState)) {
+	d.outputFunc = f
+}
+
+func (d *SteamController) UpdateInputState(state *InputState) {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
+	if state == nil {
+		d.inputState = &InputState{}
+		return
 	}
-
-	return dst
+	st := *state
+	st.Frame = atomic.AddUint32(&d.frame, 1)
+	d.inputState = &st
 }
 
-func (x *SteamController) applyProfileDefaults(profile string) {
-	x.profile = profile
-	x.descriptor = cloneDescriptor(defaultDescriptor)
-
-	switch profile {
-	case ProfileSteamDeck:
-		x.descriptor.Device.IDVendor = DefaultVIDSteam
-		x.descriptor.Device.IDProduct = DefaultPIDSteamDeck
-		x.descriptor.Strings[1] = "Valve Software"
-		x.descriptor.Strings[2] = "Steam Deck Controller"
-		x.descriptor.Strings[3] = "VIIPER-SD-05"
-		x.descriptor.Interfaces[0].HID.ReportRaw = append([]byte(nil), steamDeckControllerHIDDescriptor...)
-		x.descriptor.Interfaces[0].Endpoints[0].WMaxPacketSize = 64
-		x.descriptor.Interfaces[0].Endpoints[1].WMaxPacketSize = 64
-	case ProfileSteamGeneric:
-		x.descriptor.Device.IDVendor = DefaultVIDSteam
-		x.descriptor.Device.IDProduct = DefaultPIDSteamGeneric
-		x.descriptor.Strings[1] = "Valve Software"
-		x.descriptor.Strings[2] = "Generic Steam Controller"
-		x.descriptor.Strings[3] = "VIIPER-SGEN-05"
-		x.descriptor.Interfaces[0].HID.ReportRaw = append([]byte(nil), steamDeckControllerHIDDescriptor...)
-		x.descriptor.Interfaces[0].Endpoints[0].WMaxPacketSize = 64
-		x.descriptor.Interfaces[0].Endpoints[1].WMaxPacketSize = 64
-	default:
-		x.descriptor.Device.IDVendor = DefaultVIDSteam
-		x.descriptor.Device.IDProduct = DefaultPIDSteamDeck
-		x.descriptor.Strings[1] = "Valve Software"
-		x.descriptor.Strings[2] = "Steam Deck Controller"
-		x.descriptor.Strings[3] = "VIIPER-SD-05"
-		x.descriptor.Interfaces[0].HID.ReportRaw = append([]byte(nil), steamDeckControllerHIDDescriptor...)
-		x.descriptor.Interfaces[0].Endpoints[0].WMaxPacketSize = 64
-		x.descriptor.Interfaces[0].Endpoints[1].WMaxPacketSize = 64
+func (d *SteamController) buildInputReport(st InputState, frame uint32) []byte {
+	if d.imuBias.valid {
+		st.AccelX -= d.imuBias.accelX
+		st.AccelY -= d.imuBias.accelY
+		st.AccelZ -= d.imuBias.accelZ
+		st.GyroX -= d.imuBias.gyroX
+		st.GyroY -= d.imuBias.gyroY
+		st.GyroZ -= d.imuBias.gyroZ
 	}
+	report := st.buildReport(frame)
+	imuMode := d.imuMode()
+	if imuMode&GyroModeSendRawAccel == 0 {
+		copy(report[28:34], []byte{0, 0, 0, 0, 0, 0})
+	}
+	if imuMode&GyroModeSendRawGyro == 0 {
+		copy(report[34:40], []byte{0, 0, 0, 0, 0, 0})
+	}
+	if imuMode&GyroModeSendOrientation == 0 {
+		copy(report[40:48], []byte{0, 0, 0, 0, 0, 0, 0, 0})
+	}
+	return report
 }
 
-func (x *SteamController) SetOutputCallback(f func(elite2state.OutputState)) {
-	x.outputFunc = f
-}
-
-func (x *SteamController) UpdateInputState(state *elite2state.InputState) {
-	x.stateMu.Lock()
-	defer x.stateMu.Unlock()
-	x.inputState = state
-	atomic.AddUint32(&x.inputVersion, 1)
-}
-
-func (x *SteamController) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
+func (d *SteamController) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
 	if dir == usbip.DirIn {
 		switch ep {
-		case 1: // 0x81 - main input reports
-			x.stateMu.Lock()
-			var st elite2state.InputState
-			if x.inputState != nil {
-				st = *x.inputState
-			}
-			x.stateMu.Unlock()
-
-			now := time.Now().UnixNano()
-
-			// One-shot poll rate measurement: log after 250 polls.
-			if atomic.LoadInt64(&x.pollCount) == 0 {
-				atomic.StoreInt64(&x.pollLogNano, now)
-			}
-			cnt := atomic.AddInt64(&x.pollCount, 1)
-			if cnt == 250 {
-				logStart := atomic.LoadInt64(&x.pollLogNano)
-				elapsedS := float64(now-logStart) / 1e9
-				if elapsedS > 0 {
-					rate := 249.0 / elapsedS
-					slog.Info("Steam USB poll rate measured", "hz", fmt.Sprintf("%.1f", rate))
-				}
-			}
-
-			// Track when new input data arrives (for stale gyro zeroing).
-			v := atomic.LoadUint32(&x.inputVersion)
-			if v != x.lastReportedV {
-				x.lastReportedV = v
-				atomic.StoreInt64(&x.lastInputNano, now)
-			}
-
-			// Zero gyro when input is stale for >20ms (keepalive gap).
-			if now-atomic.LoadInt64(&x.lastInputNano) > 20_000_000 {
-				st.GyroX = 0
-				st.GyroY = 0
-				st.GyroZ = 0
-			}
-
-			return x.buildSteamDeckInputReport(st)
+		case mouseEndpointNumber:
+			return append([]byte(nil), zeroMouseReport...)
+		case keyboardEndpointNumber:
+			d.stateMu.Lock()
+			st := *d.inputState
+			d.stateMu.Unlock()
+			return d.buildLizardKeyboardReport(st)
+		case controllerEndpointNumber:
+			d.stateMu.Lock()
+			st := *d.inputState
+			d.stateMu.Unlock()
+			report := d.buildInputReport(st, st.Frame)
+			return report
 		default:
 			return nil
 		}
 	}
-
-	if dir == usbip.DirOut && ep == 1 {
-		x.parseSteamDeckOutputReport(out)
+	if dir == usbip.DirOut && ep == controllerEndpointNumber {
+		d.handleHostCommand(out)
 	}
-
 	return nil
 }
 
-func (x *SteamController) parseSteamDeckOutputReport(out []byte) {
-	start := 0
-	// Some stacks prefix an extra report-id byte (0x00) before command payload.
-	if len(out) >= 10 && out[0] == 0x00 {
-		start = 1
+func (d *SteamController) buildLizardKeyboardReport(st InputState) []byte {
+	if !d.lizardKeyboardEnabled() {
+		return append([]byte(nil), zeroKeyboardReport...)
 	}
-	if len(out) < start+2 {
-		return
-	}
-	cmdType := out[start]
 
-	// Log all incoming Steam Deck commands for protocol analysis.
-	if cmdType != SteamDeckRumbleCommandType {
-		hex := fmt.Sprintf("%02X", out[start:])
-		if len(hex) > 128 {
-			hex = hex[:128] + "..."
+	report := make([]byte, len(zeroKeyboardReport))
+	keys := make([]byte, 0, 6)
+	appendKey := func(key byte, active bool) {
+		if !active || len(keys) >= 6 {
+			return
 		}
-		slog.Info("SteamDeck: recv command", "type", fmt.Sprintf("0x%02X", cmdType), "len", len(out)-start, "hex", hex)
+		keys = append(keys, key)
 	}
 
-	if len(out) < start+9 || cmdType != SteamDeckRumbleCommandType {
-		return
-	}
+	appendKey(hidKeyEnter, st.A)
+	appendKey(hidKeyEscape, st.B)
+	appendKey(hidKeyUp, st.DPadUp)
+	appendKey(hidKeyDown, st.DPadDown)
+	appendKey(hidKeyLeft, st.DPadLeft)
+	appendKey(hidKeyRight, st.DPadRight)
 
-	left := binary.LittleEndian.Uint16(out[start+5 : start+7])
-	right := binary.LittleEndian.Uint16(out[start+7 : start+9])
-	feedback := elite2state.OutputState{
-		RumbleLeft:         uint8(left >> 8),
-		RumbleRight:        uint8(right >> 8),
-		RumbleTriggerLeft:  0,
-		RumbleTriggerRight: 0,
-	}
-	if x.outputFunc != nil {
-		x.outputFunc(feedback)
-	}
+	copy(report[2:], keys)
+	return report
 }
 
-func (x *SteamController) HandleControl(bmRequestType, bRequest uint8, wValue, _ uint16, wLength uint16, data []byte) ([]byte, bool) {
+func (d *SteamController) lizardKeyboardEnabled() bool {
+	if !d.controller.digitalMaps {
+		return false
+	}
+	return d.lizardModeEnabled()
+}
+
+func (d *SteamController) HandleControl(bmRequestType, bRequest uint8, wValue, wIndex, wLength uint16, data []byte) ([]byte, bool) {
 	const (
 		hidGetReport = 0x01
 		hidSetReport = 0x09
-	)
 
-	const (
 		reportTypeInput   = 0x01
 		reportTypeOutput  = 0x02
 		reportTypeFeature = 0x03
 	)
 
 	reportType := uint8(wValue >> 8)
-	reportID := uint8(wValue & 0xFF)
+	reportID := uint8(wValue & 0xff)
+	iface := uint8(wIndex & 0xff)
+	if iface != controllerInterfaceNumber {
+		return nil, false
+	}
 
-	if bmRequestType == 0xA1 && bRequest == hidGetReport {
-		if reportType == reportTypeInput {
-			x.stateMu.Lock()
-			var st elite2state.InputState
-			if x.inputState != nil {
-				st = *x.inputState
-			}
-			x.stateMu.Unlock()
-			report := x.buildSteamDeckInputReport(st)
+	if bmRequestType == 0xa1 && bRequest == hidGetReport {
+		switch reportType {
+		case reportTypeInput:
+			d.stateMu.Lock()
+			st := *d.inputState
+			d.stateMu.Unlock()
+			report := d.buildInputReport(st, st.Frame)
 			if wLength > 0 && int(wLength) < len(report) {
 				return report[:wLength], true
 			}
 			return report, true
-		}
-
-		if reportType == reportTypeFeature {
-			slog.Info("SteamDeck: GetFeature", "reportID", fmt.Sprintf("0x%02X", reportID), "wLength", wLength)
-			size := int(wLength)
-			if size <= 0 {
-				size = InputReportSizeSteamDeck
+		case reportTypeFeature:
+			resp := d.getFeatureResponse(reportID)
+			if resp == nil {
+				return nil, false
 			}
-			buf := make([]byte, size)
-			return buf, true
+			if wLength > 0 && int(wLength) < len(resp) {
+				return resp[:wLength], true
+			}
+			return resp, true
 		}
 	}
 
 	if bmRequestType == 0x21 && bRequest == hidSetReport {
 		if reportType == reportTypeOutput || reportType == reportTypeFeature {
-			x.parseSteamDeckOutputReport(data)
+			data = normalizeHostCommand(data, reportID)
+			if reportType == reportTypeFeature {
+				d.setFeatureResponse(data)
+			}
+			d.handleHostCommand(data)
 			return nil, true
 		}
 	}
 
-	slog.Warn("SteamController: unsupported control request",
-		"bmRequestType", bmRequestType,
-		"bRequest", bRequest,
-		"reportType", reportType,
-		"reportID", reportID)
-
 	return nil, false
 }
 
-func (x *SteamController) GetDescriptor() *usb.Descriptor {
-	return &x.descriptor
-}
-
-func (x *SteamController) GetDeviceSpecificArgs() map[string]any {
-	return map[string]any{
-		"profile": x.profile,
+func normalizeHostCommand(data []byte, reportID uint8) []byte {
+	if len(data) == 0 && reportID != 0 {
+		return []byte{reportID}
 	}
+	if len(data) > 1 && data[0] == 0x00 {
+		return append([]byte(nil), data[1:]...)
+	}
+	return append([]byte(nil), data...)
 }
 
-// buildSteamDeckInputReport packs an InputState into a 64-byte Steam Deck
-// vendor input report. Bit layout / byte offsets mirror InputPlumber's
-// captures of the real Deck protocol.
-func (x *SteamController) buildSteamDeckInputReport(s elite2state.InputState) []byte {
-	b := make([]byte, InputReportSizeSteamDeck)
-	b[0] = SteamDeckInputMajorVersion
-	b[1] = SteamDeckInputMinorVersion
-	b[2] = SteamDeckInputReportType
-	b[3] = InputReportSizeSteamDeck
-	// Monotonic frame counter: increment every poll so each report is unique.
-	// SDL uses counter for duplicate detection; duplicates cause instability.
-	binary.LittleEndian.PutUint32(b[4:8], atomic.AddUint32(&x.frame, 1))
-
-	setBit := func(byteIndex int, bit uint8, on bool) {
-		if on {
-			// Steam Deck button bytes are specified with msb0 bit numbering
-			// (bit 0 is 0x80, bit 7 is 0x01).
-			if bit < 8 {
-				b[byteIndex] |= 1 << (7 - bit)
-			}
+func (d *SteamController) handleHostCommand(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	if len(data) > 1 && data[0] == 0x00 {
+		data = data[1:]
+	}
+	switch data[0] {
+	case FeatureSetControllerMode:
+		if len(data) >= 3 {
+			d.controller.mode = data[2]
+		}
+	case FeatureSetSettingsValues:
+		d.applySettings(data)
+	case FeatureLoadDefaultSettings:
+		d.resetSettings()
+	case FeatureFactoryReset:
+		d.controller = newControllerState()
+		d.imuBias = imuBiasState{}
+	case FeatureClearSettingsValues:
+		d.resetSettings()
+	case FeatureClearDigitalMappings:
+		d.controller.digitalMaps = false
+	case FeatureSetDefaultMappings:
+		d.controller.digitalMaps = true
+	case FeatureSetDigitalMappings:
+		d.controller.digitalMaps = true
+	case FeatureResetIMU:
+		d.stateMu.Lock()
+		st := *d.inputState
+		d.stateMu.Unlock()
+		d.imuBias = imuBiasState{
+			valid:  true,
+			accelX: st.AccelX,
+			accelY: st.AccelY,
+			accelZ: st.AccelZ,
+			gyroX:  st.GyroX,
+			gyroY:  st.GyroY,
+			gyroZ:  st.GyroZ,
 		}
 	}
-
-	// Byte 8
-	setBit(8, 0, s.Buttons&xboxelite2.ButtonA != 0)
-	setBit(8, 1, s.Buttons&xboxelite2.ButtonX != 0)
-	setBit(8, 2, s.Buttons&xboxelite2.ButtonB != 0)
-	setBit(8, 3, s.Buttons&xboxelite2.ButtonY != 0)
-	setBit(8, 4, s.Buttons&xboxelite2.ButtonLB != 0)
-	setBit(8, 5, s.Buttons&xboxelite2.ButtonRB != 0)
-	// Match SteamDeck target behavior: digital trigger bits should only activate
-	// close to full pull to avoid noisy analog jitter being interpreted as button chords.
-	const steamDigitalTriggerThreshold = 204 // ~80% of 255
-	setBit(8, 6, s.LT >= steamDigitalTriggerThreshold)
-	setBit(8, 7, s.RT >= steamDigitalTriggerThreshold)
-
-	// Byte 9
-	setBit(9, 0, s.Buttons&xboxelite2.ButtonP2 != 0)    // L5
-	setBit(9, 1, s.Buttons&xboxelite2.ButtonStart != 0) // menu
-	setBit(9, 2, s.Buttons&xboxelite2.ButtonGuide != 0) // steam
-	setBit(9, 3, s.Buttons&xboxelite2.ButtonBack != 0)  // options
-	setBit(9, 4, s.DPad&xboxelite2.DPadDown != 0)
-	setBit(9, 5, s.DPad&xboxelite2.DPadLeft != 0)
-	setBit(9, 6, s.DPad&xboxelite2.DPadRight != 0)
-	setBit(9, 7, s.DPad&xboxelite2.DPadUp != 0)
-
-	// Byte 10 / 11 / 13 / 14
-	setBit(10, 1, s.Buttons&xboxelite2.ButtonLThumb != 0)
-	setBit(10, 3, s.TouchFlags&elite2state.TouchFlagRightPadTouch != 0) // r_pad_touch
-	setBit(10, 5, s.TouchFlags&elite2state.TouchFlagRightPadPress != 0) // r_pad_press
-	setBit(10, 7, s.Buttons&xboxelite2.ButtonP1 != 0)                  // R5
-	setBit(11, 5, s.Buttons&xboxelite2.ButtonRThumb != 0)
-	setBit(13, 5, s.Buttons&xboxelite2.ButtonP3 != 0)       // R4
-	setBit(13, 6, s.Buttons&xboxelite2.ButtonP4 != 0)       // L4
-	setBit(14, 5, s.Reserved&xboxelite2.ReservedShare != 0) // quick_access
-
-	// Right touchpad coordinates (signed i16, Steam format).
-	binary.LittleEndian.PutUint16(b[20:22], uint16(s.RPadX))
-	binary.LittleEndian.PutUint16(b[22:24], uint16(s.RPadY))
-
-	// Analog triggers (0..32767 on Deck reports)
-	binary.LittleEndian.PutUint16(b[44:46], uint16(s.LT)*128)
-	binary.LittleEndian.PutUint16(b[46:48], uint16(s.RT)*128)
-
-	// IMU (raw i16 values).
-	binary.LittleEndian.PutUint16(b[24:26], uint16(s.AccelX))
-	binary.LittleEndian.PutUint16(b[26:28], uint16(s.AccelY))
-	binary.LittleEndian.PutUint16(b[28:30], uint16(s.AccelZ))
-	binary.LittleEndian.PutUint16(b[30:32], uint16(s.GyroX)) // pitch
-	binary.LittleEndian.PutUint16(b[32:34], uint16(s.GyroY)) // yaw
-	binary.LittleEndian.PutUint16(b[34:36], uint16(s.GyroZ)) // roll
-
-	// Sticks.
-	binary.LittleEndian.PutUint16(b[48:50], uint16(s.LX))
-	binary.LittleEndian.PutUint16(b[50:52], uint16(s.LY))
-	binary.LittleEndian.PutUint16(b[52:54], uint16(s.RX))
-	binary.LittleEndian.PutUint16(b[54:56], uint16(s.RY))
-
-	// Right touchpad force.
-	rPadForce := s.RPadForce
-	if rPadForce > 32767 {
-		rPadForce = 32767
+	if d.outputFunc == nil {
+		return
 	}
-	binary.LittleEndian.PutUint16(b[58:60], rPadForce)
+	var out OutputState
+	copy(out.Data[:], data)
+	d.outputFunc(out)
+}
 
-	return b
+func cloneSettings(src map[uint8]uint16) map[uint8]uint16 {
+	dst := make(map[uint8]uint16, len(src))
+	for setting, value := range src {
+		dst[setting] = value
+	}
+	return dst
+}
+
+func (d *SteamController) resetSettings() {
+	state := newControllerState()
+	d.controller.settings = cloneSettings(state.settings)
+	d.controller.mode = state.mode
+	d.imuBias = imuBiasState{}
+}
+
+func (d *SteamController) applySettings(data []byte) {
+	if len(data) < 2 {
+		return
+	}
+	payloadLen := int(data[1])
+	if payloadLen > len(data)-2 {
+		payloadLen = len(data) - 2
+	}
+	for offset := 2; offset+2 < 2+payloadLen; offset += 3 {
+		setting := data[offset]
+		value := binary.LittleEndian.Uint16(data[offset+1 : offset+3])
+		d.controller.settings[setting] = value
+		if setting == SettingLizardMode {
+			d.controller.mode = byte(value)
+		}
+	}
+}
+
+func (d *SteamController) getFeatureResponse(reportID uint8) []byte {
+	if reportID != 0 {
+		return d.featureResponse([]byte{reportID})
+	}
+
+	d.featureMu.Lock()
+	defer d.featureMu.Unlock()
+	if len(d.lastFeatureResponse) == 0 {
+		return nil
+	}
+	return append([]byte(nil), d.lastFeatureResponse...)
+}
+
+func (d *SteamController) setFeatureResponse(request []byte) {
+	resp := d.featureResponse(request)
+	d.featureMu.Lock()
+	defer d.featureMu.Unlock()
+	if resp == nil {
+		d.lastFeatureResponse = nil
+		return
+	}
+	d.lastFeatureResponse = append([]byte(nil), resp...)
+}
+
+func (d *SteamController) featureResponse(request []byte) []byte {
+	if len(request) == 0 {
+		return nil
+	}
+	command := request[0]
+	resp := make([]byte, InputReportLen)
+	resp[0] = command
+	switch command {
+	case FeatureSetSettingsValues, FeatureClearDigitalMappings, FeatureSetDefaultMappings, FeatureSetDigitalMappings,
+		FeatureClearSettingsValues, FeatureSetControllerMode, FeatureLoadDefaultSettings, FeatureFactoryReset, FeatureResetIMU:
+		copy(resp, request)
+		return resp
+	case FeatureGetDeviceInfo:
+		resp[1] = byte(14 + len("Wired Controller"))
+		binary.LittleEndian.PutUint16(resp[4:6], d.descriptor.Device.IDVendor)
+		binary.LittleEndian.PutUint16(resp[6:8], d.descriptor.Device.IDProduct)
+		resp[8] = 0x01
+		resp[9] = d.reportedControllerMode()
+		copy(resp[16:], []byte("Wired Controller"))
+		return resp
+	case FeatureGetChipID:
+		resp[1] = 14
+		copy(resp[4:], []byte("STEAMCTRL-0001"))
+		return resp
+	case FeatureGetAttributesValues:
+		resp[1] = d.fillAttributes(resp[2:])
+		return resp
+	case FeatureGetStringAttribute:
+		resp[1] = d.fillStringAttribute(resp[2:], request)
+		return resp
+	case FeatureGetDigitalMappings:
+		resp[1] = d.fillDigitalMappings(resp[2:])
+		return resp
+	case FeatureGetSettingsValues:
+		resp[1] = fillSettings(resp[2:], d.controller.settings)
+		return resp
+	case FeatureGetSettingsDefaults:
+		resp[1] = fillSettings(resp[2:], firmwareDefaultSettings)
+		return resp
+	case FeatureGetSettingsMaxs:
+		resp[1] = fillSettings(resp[2:], maxSettings)
+		return resp
+	default:
+		return nil
+	}
+}
+
+func (d *SteamController) fillDigitalMappings(buf []byte) byte {
+	if len(buf) == 0 {
+		return 0
+	}
+	if !d.controller.digitalMaps {
+		buf[0] = 0xff
+		return 1
+	}
+	buf[0] = 0x00
+	return 1
+}
+
+func fillSettings(buf []byte, settings map[uint8]uint16) byte {
+	offset := 0
+	for _, setting := range settingsOrder {
+		value, ok := settings[setting]
+		if !ok || offset+3 > len(buf) {
+			continue
+		}
+		buf[offset] = setting
+		binary.LittleEndian.PutUint16(buf[offset+1:offset+3], value)
+		offset += 3
+	}
+	return byte(offset)
+}
+
+func (d *SteamController) fillAttributes(buf []byte) byte {
+	entries := []struct {
+		tag   byte
+		value uint32
+	}{
+		{tag: AttributeUniqueID, value: d.controller.uniqueID},
+		{tag: AttributeProductID, value: uint32(d.descriptor.Device.IDProduct)},
+		{tag: AttributeCapabilities, value: CapabilityAll},
+		{tag: AttributeBoardRevision, value: d.controller.boardRev},
+		{tag: AttributeFirmwareBuildTime, value: d.controller.firmwareTime},
+		{tag: AttributeConnectionIntervalUs, value: 9000},
+	}
+
+	offset := 0
+	for _, entry := range entries {
+		if offset+5 > len(buf) {
+			break
+		}
+		buf[offset] = entry.tag
+		binary.LittleEndian.PutUint32(buf[offset+1:offset+5], entry.value)
+		offset += 5
+	}
+	return byte(offset)
+}
+
+func (d *SteamController) fillStringAttribute(buf []byte, request []byte) byte {
+	if len(buf) < 2 {
+		return 0
+	}
+	attribute := byte(StringAttributeBoardSerial)
+	if len(request) >= 3 {
+		attribute = request[2]
+	}
+	buf[0] = attribute
+
+	value := d.controller.boardSerial
+	if attribute == byte(StringAttributeUnitSerial) {
+		value = d.controller.unitSerial
+	}
+	count := copy(buf[1:], []byte(value))
+	return byte(count)
+}
+
+func (d *SteamController) GetDescriptor() *usb.Descriptor {
+	return &d.descriptor
+}
+
+func (d *SteamController) GetDeviceSpecificArgs() map[string]any {
+	return map[string]any{}
+}
+
+var reportDescriptor = hid.Report{
+	Items: []hid.Item{
+		hid.UsagePage{Page: 0xff00},
+		hid.Usage{Usage: 0x01},
+		hid.Collection{Kind: hid.CollectionApplication, Items: []hid.Item{
+			hid.LogicalMinimum{Min: 0},
+			hid.LogicalMaximum{Max: 255},
+			hid.ReportSize{Bits: 8},
+			hid.ReportCount{Count: 64},
+			hid.Usage{Usage: 0x01},
+			hid.Input{Flags: hid.MainData | hid.MainVar | hid.MainAbs},
+			hid.ReportCount{Count: 64},
+			hid.Usage{Usage: 0x01},
+			hid.Output{Flags: hid.MainData | hid.MainVar | hid.MainAbs},
+			hid.ReportCount{Count: 64},
+			hid.Usage{Usage: 0x01},
+			hid.Feature{Flags: hid.MainData | hid.MainVar | hid.MainAbs},
+		}},
+	},
+}
+
+var mouseReportDescriptor = hid.Report{
+	Items: []hid.Item{
+		hid.UsagePage{Page: hid.UsagePageGenericDesktop},
+		hid.Usage{Usage: hid.UsageMouse},
+		hid.Collection{Kind: hid.CollectionApplication, Items: []hid.Item{
+			hid.Usage{Usage: hid.UsagePointer},
+			hid.Collection{Kind: hid.CollectionPhysical, Items: []hid.Item{
+				hid.UsagePage{Page: hid.UsagePageButton},
+				hid.UsageMinimum{Min: 0x01},
+				hid.UsageMaximum{Max: 0x05},
+				hid.LogicalMinimum{Min: 0},
+				hid.LogicalMaximum{Max: 1},
+				hid.ReportCount{Count: 5},
+				hid.ReportSize{Bits: 1},
+				hid.Input{Flags: hid.MainData | hid.MainVar | hid.MainAbs},
+				hid.ReportCount{Count: 1},
+				hid.ReportSize{Bits: 3},
+				hid.Input{Flags: hid.MainConst},
+				hid.UsagePage{Page: hid.UsagePageGenericDesktop},
+				hid.Usage{Usage: hid.UsageX},
+				hid.Usage{Usage: hid.UsageY},
+				hid.Usage{Usage: hid.UsageWheel},
+				hid.LogicalMinimum{Min: -127},
+				hid.LogicalMaximum{Max: 127},
+				hid.ReportSize{Bits: 8},
+				hid.ReportCount{Count: 3},
+				hid.Input{Flags: hid.MainData | hid.MainVar | hid.MainRel},
+			}},
+		}},
+	},
+}
+
+var keyboardReportDescriptor = hid.Report{
+	Items: []hid.Item{
+		hid.UsagePage{Page: hid.UsagePageGenericDesktop},
+		hid.Usage{Usage: hid.UsageKeyboard},
+		hid.Collection{Kind: hid.CollectionApplication, Items: []hid.Item{
+			hid.UsagePage{Page: hid.UsagePageKeyboard},
+			hid.UsageMinimum{Min: 0xE0},
+			hid.UsageMaximum{Max: 0xE7},
+			hid.LogicalMinimum{Min: 0},
+			hid.LogicalMaximum{Max: 1},
+			hid.ReportSize{Bits: 1},
+			hid.ReportCount{Count: 8},
+			hid.Input{Flags: hid.MainData | hid.MainVar | hid.MainAbs},
+			hid.ReportSize{Bits: 8},
+			hid.ReportCount{Count: 1},
+			hid.Input{Flags: hid.MainConst},
+			hid.ReportSize{Bits: 8},
+			hid.ReportCount{Count: 6},
+			hid.LogicalMinimum{Min: 0},
+			hid.LogicalMaximum{Max: 255},
+			hid.UsageMinimum{Min: 0x00},
+			hid.UsageMaximum{Max: 0xFF},
+			hid.Input{Flags: hid.MainData | hid.MainArray},
+			hid.UsagePage{Page: hid.UsagePageLEDs},
+			hid.UsageMinimum{Min: 0x01},
+			hid.UsageMaximum{Max: 0x05},
+			hid.LogicalMinimum{Min: 0},
+			hid.LogicalMaximum{Max: 1},
+			hid.ReportCount{Count: 5},
+			hid.ReportSize{Bits: 1},
+			hid.Output{Flags: hid.MainData | hid.MainVar | hid.MainAbs},
+			hid.ReportCount{Count: 1},
+			hid.ReportSize{Bits: 3},
+			hid.Output{Flags: hid.MainConst},
+		}},
+	},
+}
+
+func makeHIDFunction(report hid.Report) *usb.HIDFunction {
+	return &usb.HIDFunction{
+		Descriptor: usb.HIDDescriptor{
+			BcdHID:       0x0111,
+			BCountryCode: 0x00,
+			Descriptors:  []usb.HIDSubDescriptor{{Type: usb.ReportDescType}},
+		},
+		Report: report,
+	}
+}
+
+var defaultDescriptor = usb.Descriptor{
+	Device: usb.DeviceDescriptor{
+		BcdUSB:             0x0200,
+		BDeviceClass:       0x00,
+		BDeviceSubClass:    0x00,
+		BDeviceProtocol:    0x00,
+		BMaxPacketSize0:    0x40,
+		IDVendor:           DefaultVID,
+		IDProduct:          DefaultPID,
+		BcdDevice:          0x0100,
+		IManufacturer:      0x01,
+		IProduct:           0x02,
+		ISerialNumber:      0x00,
+		BNumConfigurations: 0x01,
+		Speed:              2,
+	},
+	Config: usb.ConfigHeader{
+		BConfigurationValue: 0x01,
+		BMAttributes:        0xa0,
+		BMaxPower:           250,
+	},
+	Interfaces: []usb.InterfaceConfig{
+		{
+			Descriptor: usb.InterfaceDescriptor{
+				BInterfaceNumber:   keyboardInterfaceNumber,
+				BAlternateSetting:  0x00,
+				BNumEndpoints:      0x01,
+				BInterfaceClass:    0x03,
+				BInterfaceSubClass: 0x01,
+				BInterfaceProtocol: 0x01,
+				IInterface:         0x03,
+			},
+			HID: makeHIDFunction(keyboardReportDescriptor),
+			Endpoints: []usb.EndpointDescriptor{{
+				BEndpointAddress: 0x80 | keyboardEndpointNumber,
+				BMAttributes:     0x03,
+				WMaxPacketSize:   0x0008,
+				BInterval:        0x0a,
+			}},
+		},
+		{
+			Descriptor: usb.InterfaceDescriptor{
+				BInterfaceNumber:   mouseInterfaceNumber,
+				BAlternateSetting:  0x00,
+				BNumEndpoints:      0x01,
+				BInterfaceClass:    0x03,
+				BInterfaceSubClass: 0x00,
+				BInterfaceProtocol: 0x02,
+				IInterface:         0x04,
+			},
+			HID: makeHIDFunction(mouseReportDescriptor),
+			Endpoints: []usb.EndpointDescriptor{{
+				BEndpointAddress: 0x80 | mouseEndpointNumber,
+				BMAttributes:     0x03,
+				WMaxPacketSize:   0x0004,
+				BInterval:        0x06,
+			}},
+		},
+		{
+			Descriptor: usb.InterfaceDescriptor{
+				BInterfaceNumber:   controllerInterfaceNumber,
+				BAlternateSetting:  0x00,
+				BNumEndpoints:      0x01,
+				BInterfaceClass:    0x03,
+				BInterfaceSubClass: 0x00,
+				BInterfaceProtocol: 0x00,
+				IInterface:         0x05,
+			},
+			HID: makeHIDFunction(reportDescriptor),
+			Endpoints: []usb.EndpointDescriptor{{
+				BEndpointAddress: 0x80 | controllerEndpointNumber,
+				BMAttributes:     0x03,
+				WMaxPacketSize:   0x0040,
+				BInterval:        0x06,
+			}},
+		},
+	},
+	Strings: map[uint8]string{
+		0: "\x04\x09",
+		1: "Valve Software",
+		2: "Wired Controller",
+		3: "Keyboard",
+		4: "Mouse",
+		5: "Valve",
+	},
 }
