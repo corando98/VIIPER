@@ -351,8 +351,13 @@ var defaultDescriptor = usb.Descriptor{
 							hid.Input{Flags: hid.MainData | hid.MainVar | hid.MainAbs},
 
 							hid.UsagePage{Page: hid.UsagePageGenericDesktop},
-							hid.Usage{Usage: 0x32},
-							hid.Usage{Usage: 0x35},
+							// L2 / R2 analog triggers — Rx (0x33) / Ry (0x34), matching a
+							// real DualShock 4. NOT Z (0x32) / Rz (0x35): those duplicate
+							// the right-stick usages and confuse Windows' RawGameController
+							// axis enumeration (breaks Xbox Game Bar trigger nav). See the
+							// matching fix + rationale in device/dualsense/device.go.
+							hid.Usage{Usage: 0x33}, // Rx = L2
+							hid.Usage{Usage: 0x34}, // Ry = R2
 							hid.LogicalMinimum{Min: 0},
 							hid.LogicalMaximum{Max: 255},
 							hid.ReportSize{Bits: 8},
