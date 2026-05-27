@@ -767,7 +767,17 @@ func (s *Server) processSubmit(dev usb.Device, ep uint32, dir uint32, setup []by
 		case usbDescTypeConfiguration:
 			data = s.buildConfigDescriptor(desc)
 		case usbDescTypeString:
-			if s, ok := desc.Strings[dindex]; ok {
+			// MS OS 1.0 probe: Windows queries STRING index 0xEE to discover
+			// whether the device supports the Microsoft OS descriptor
+			// protocol. Devices that opt in (currently Switch 2 Pro via
+			// ns2pro) populate Descriptor.MicrosoftOS10 with a vendor code;
+			// returning the fixed 18-byte signature here tells Windows it
+			// can follow up with vendor-class requests for the Compatible-ID
+			// and Extended-Properties descriptors (those follow-ups are not
+			// wired yet — see MicrosoftOS10Descriptor doc).
+			if dindex == 0xEE && desc.MicrosoftOS10 != nil {
+				data = desc.MicrosoftOS10.StringDescriptor()
+			} else if s, ok := desc.Strings[dindex]; ok {
 				data = usb.EncodeStringDescriptor(s)
 			}
 		}
@@ -838,13 +848,31 @@ func (s *Server) processSubmit(dev usb.Device, ep uint32, dir uint32, setup []by
 
 func (s *Server) buildConfigDescriptor(desc *usb.Descriptor) []byte {
 	var b bytes.Buffer
-	h := usb.ConfigHeader{
-		WTotalLength:        0, // to be patched
-		BNumInterfaces:      interfaceCount(desc.Interfaces),
-		BConfigurationValue: usbConfigValueDefault,
-		IConfiguration:      0,
-		BMAttributes:        usbConfigAttrBusPowered,
-		BMaxPower:           usbConfigMaxPower100mA,
+	// Two ways to supply the config header: legacy `Config: ConfigHeader{...}`
+	// (existing devices) and the slimmer `Configuration: &ConfigurationDescriptor{...}`
+	// from ports like ns2pro. When the new form is set it wins — WTotalLength
+	// and BNumInterfaces stay derived (we recompute them below anyway).
+	var h usb.ConfigHeader
+	if desc.Configuration != nil {
+		h = usb.ConfigHeader{
+			BConfigurationValue: desc.Configuration.BConfigurationValue,
+			IConfiguration:      desc.Configuration.IConfiguration,
+			BMAttributes:        desc.Configuration.BMAttributes,
+			BMaxPower:           desc.Configuration.BMaxPower,
+		}
+	} else {
+		h = desc.Config
+	}
+	h.WTotalLength = 0 // to be patched
+	h.BNumInterfaces = interfaceCount(desc.Interfaces)
+	if h.BConfigurationValue == 0 {
+		h.BConfigurationValue = usbConfigValueDefault
+	}
+	if h.BMAttributes == 0 {
+		h.BMAttributes = usbConfigAttrBusPowered
+	}
+	if h.BMaxPower == 0 {
+		h.BMaxPower = usbConfigMaxPower100mA
 	}
 	h.Write(&b)
 	for _, iface := range desc.Interfaces {

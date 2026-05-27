@@ -32,9 +32,92 @@ type Data []uint8
 
 // Descriptor holds all static descriptor/config data for a device.
 type Descriptor struct {
-	Device     DeviceDescriptor
-	Interfaces []InterfaceConfig
-	Strings    map[uint8]string
+	Device DeviceDescriptor
+	// Config is the original (full) configuration-descriptor header used by
+	// existing devices (xbox360, dualshock4, switchpro, ...). For new
+	// devices ported from forks that use a slimmer Configuration shape (see
+	// ConfigurationDescriptor below — only the non-derived fields), the
+	// server.go config-bytes builder prefers Configuration when it is set
+	// and falls back to Config otherwise. Devices should set exactly one.
+	Config        ConfigHeader
+	Configuration *ConfigurationDescriptor
+	// MicrosoftOS10, when non-nil, causes the server to respond to a
+	// GET_DESCRIPTOR for STRING index 0xEE with the MS OS 1.0 probe string,
+	// signalling Windows that the device supports the Microsoft OS
+	// descriptor protocol. Used by the Switch 2 Pro Controller backend so
+	// the bulk vendor-specific interface gets WinUSB-class probing. The
+	// follow-on Compatible-ID / Extended-Properties vendor request handling
+	// isn't wired yet — the HID interface still binds the standard HID
+	// class driver, which is sufficient for game input.
+	MicrosoftOS10 *MicrosoftOS10Descriptor
+	Interfaces    []InterfaceConfig
+	Strings       map[uint8]string
+}
+
+// NumInterfaces returns the count of distinct interface numbers across the
+// active configuration. Alternate settings share an interface number and only
+// count once — the USB configuration descriptor header reflects the cardinal
+// interface count, not the descriptor array length.
+func (d Descriptor) NumInterfaces() uint8 {
+	seen := map[uint8]struct{}{}
+	for _, iface := range d.Interfaces {
+		seen[iface.Descriptor.BInterfaceNumber] = struct{}{}
+	}
+	return uint8(len(seen))
+}
+
+// ConfigurationDescriptor holds the non-derived fields from the USB
+// configuration descriptor — the fields a device wants to control. Total
+// length and interface count are computed by the server when the wire bytes
+// are emitted. Zero values cause the server to fall back to its built-in
+// defaults (BConfigurationValue=1, BMAttributes=bus-powered, BMaxPower=100mA).
+//
+// This is an alternative to Config (ConfigHeader) for devices that want to
+// stay focused on non-derived fields. server.go prefers Configuration when
+// it is non-nil; otherwise it falls back to Config.
+type ConfigurationDescriptor struct {
+	BConfigurationValue uint8
+	IConfiguration      uint8
+	BMAttributes        uint8
+	BMaxPower           uint8
+}
+
+// MicrosoftOS10Descriptor enables the Microsoft OS 1.0 descriptor probe
+// used by Windows to bind vendor-specific interfaces to inbox drivers such
+// as WinUSB. The probe sequence is: the host issues a GET_DESCRIPTOR for
+// STRING index 0xEE; the device returns this fixed-format 18-byte response
+// with a vendor-specific code. Windows then sends class-specific vendor
+// control requests using that code to fetch the Compatible-ID descriptor.
+//
+// NOTE: server.go currently answers ONLY the 0xEE string probe — the
+// Compatible-ID and Extended-Properties follow-up requests are not wired
+// yet. Windows therefore sees "device claims MS OS support" but does not
+// auto-bind WinUSB to the bulk interface. The HID interface still binds
+// normally so the gamepad input path works end-to-end.
+type MicrosoftOS10Descriptor struct {
+	VendorCode uint8
+}
+
+// StringDescriptor returns the 18-byte fixed response the device emits when
+// the host probes STRING index 0xEE. The leading "MSFT100" magic identifies
+// the MS OS 1.0 protocol; the trailing vendor code is what the host echoes
+// back in the bRequest field of follow-up vendor requests.
+func (d MicrosoftOS10Descriptor) StringDescriptor() []byte {
+	vendorCode := d.VendorCode
+	if vendorCode == 0 {
+		vendorCode = 0x20
+	}
+	return []byte{
+		0x12, 0x03,
+		'M', 0x00,
+		'S', 0x00,
+		'F', 0x00,
+		'T', 0x00,
+		'1', 0x00,
+		'0', 0x00,
+		'0', 0x00,
+		vendorCode, 0x00,
+	}
 }
 
 // InterfaceConfig holds all descriptors for a single interface for bus management.
