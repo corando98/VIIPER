@@ -36,9 +36,12 @@ import (
 	_ "github.com/Alia5/VIIPER/internal/registry"
 
 	"github.com/Alia5/VIIPER/device"
+	"github.com/Alia5/VIIPER/device/dualsense"
 	"github.com/Alia5/VIIPER/device/dualsenseedge"
 	"github.com/Alia5/VIIPER/device/dualshock4"
+	"github.com/Alia5/VIIPER/device/ns2pro"
 	"github.com/Alia5/VIIPER/device/steamcontroller"
+	"github.com/Alia5/VIIPER/device/steamdeck"
 	"github.com/Alia5/VIIPER/device/switchpro"
 	"github.com/Alia5/VIIPER/device/xbox360"
 	"github.com/Alia5/VIIPER/device/xboxelite2"
@@ -77,20 +80,104 @@ type deviceInfo struct {
 	typeName string // resolved registry name, e.g. "xbox360", "dualshock4", "dualsenseedge", "xboxelite2", "steamcontroller"
 }
 
+// deviceAlias describes a user-friendly device-type name and how it maps
+// onto a registry entry, an optional profile string, and optional VID/PID
+// overrides. The overrides are only applied when the caller does not pass
+// explicit VID/PID values via viiper_device_add_ex.
+type deviceAlias struct {
+	registryName   string
+	profile        string
+	vidOverride    *uint16
+	pidOverride    *uint16
+	deprecationMsg string // logged once-per-process via warnDeprecatedAlias when this alias is used.
+}
+
+func u16Ptr(v uint16) *uint16 { return &v }
+
+// Handheld PIDs in Valve's 0x12Fx range used by Steam Input on
+// third-party handhelds. The 0x28DE VID is Valve Corporation.
+var (
+	pidValveVendor   = u16Ptr(0x28DE)
+	pidSteamDeck     = u16Ptr(0x1205)
+	pidMSIClaw       = u16Ptr(0x12FA)
+	pidLenovoLegion2 = u16Ptr(0x12FB)
+	pidZotacZone     = u16Ptr(0x12FC)
+	pidASUSRogAlly   = u16Ptr(0x12FD)
+	pidLenovoLegion  = u16Ptr(0x12FE)
+	pidLenovoLegionS = u16Ptr(0x12FF)
+)
+
 // deviceTypeAliases maps user-friendly names to their registry type + profile.
 // If a name is not in this map, it's used as-is against the device registry.
-var deviceTypeAliases = map[string]struct {
-	registryName string
-	profile      string
-}{
-	"steamdeck":         {registryName: "steamcontroller", profile: "steamdeck"},
-	"steamdeck-generic": {registryName: "steamcontroller", profile: "steamdeck-generic"},
-	"steam-generic":     {registryName: "steamcontroller", profile: "steamdeck-generic"},
-	"steam-controller":  {registryName: "steamcontroller", profile: "steamdeck-generic"},
-	"xbox-one":          {registryName: "xboxelite2", profile: "xbox-one"},
-	"xbox-elite":        {registryName: "xboxelite2", profile: "xbox-one-elite"},
-	"joycon-left":       {registryName: "switchpro", profile: "joycon-left"},
-	"joycon-right":      {registryName: "switchpro", profile: "joycon-right"},
+var deviceTypeAliases = map[string]deviceAlias{
+	// Steam Deck and Valve 0x12Fx-range third-party handhelds. All route to
+	// the steamdeck device with a VID/PID override per platform.
+	"steamdeck":   {registryName: "steamdeck"},
+	"steam-deck":  {registryName: "steamdeck"},
+	"deck":        {registryName: "steamdeck"},
+	"msi-claw":    {registryName: "steamdeck", vidOverride: pidValveVendor, pidOverride: pidMSIClaw},
+	"legion-go":   {registryName: "steamdeck", vidOverride: pidValveVendor, pidOverride: pidLenovoLegion},
+	"legion-go-2": {registryName: "steamdeck", vidOverride: pidValveVendor, pidOverride: pidLenovoLegion2},
+	"legion-go-s": {registryName: "steamdeck", vidOverride: pidValveVendor, pidOverride: pidLenovoLegionS},
+	"rog-ally":    {registryName: "steamdeck", vidOverride: pidValveVendor, pidOverride: pidASUSRogAlly},
+	"zotac-zone":  {registryName: "steamdeck", vidOverride: pidValveVendor, pidOverride: pidZotacZone},
+
+	// Deprecated steamdeck-family names. Pre-rewrite these routed to the broken
+	// device/steamcontroller profile; they now resolve to the real steamdeck.
+	"steamdeck-generic": {registryName: "steamdeck", deprecationMsg: "'steamdeck-generic' is deprecated; use 'steamdeck' (or a specific handheld alias like 'legion-go-2')"},
+	"steam-generic":     {registryName: "steamdeck", deprecationMsg: "'steam-generic' is deprecated; use 'steamdeck' (or a specific handheld alias like 'legion-go-2')"},
+
+	// Steam Controller V1 (wired Gordon). Canonical name: "gordon".
+	"gordon":              {registryName: "steamcontroller"},
+	"steam-controller-v1": {registryName: "steamcontroller"},
+	"steam-controller":    {registryName: "steamcontroller", deprecationMsg: "'steam-controller' now refers to the wired Steam Controller V1 (Gordon); use 'steamdeck' for the Steam Deck handheld"},
+	"steamcontroller-v1":  {registryName: "steamcontroller"},
+
+	// Xbox family.
+	"xbox-one":   {registryName: "xboxelite2", profile: "xbox-one"},
+	"xbox-elite": {registryName: "xboxelite2", profile: "xbox-one-elite"},
+
+	// Switch family.
+	"joycon-left":  {registryName: "switchpro", profile: "joycon-left"},
+	"joycon-right": {registryName: "switchpro", profile: "joycon-right"},
+
+	// Sony DualSense (regular, not Edge).
+	"dualsense": {registryName: "dualsense"},
+	"ds5":       {registryName: "dualsense"},
+}
+
+// deprecationOnce ensures each deprecation warning fires at most once per
+// process lifetime, regardless of how many times the alias is used.
+var deprecationOnce sync.Map // map[string]*sync.Once
+
+func warnDeprecatedAlias(name, msg string) {
+	once, _ := deprecationOnce.LoadOrStore(name, &sync.Once{})
+	once.(*sync.Once).Do(func() { slog.Warn(msg, "alias", name) })
+}
+
+// applyAlias resolves a user-typed device-type name through deviceTypeAliases
+// and populates registryName + opts (profile and any VID/PID overrides not
+// already set by the caller).
+func applyAlias(tn string, opts *device.CreateOptions) string {
+	alias, ok := deviceTypeAliases[tn]
+	if !ok {
+		return tn
+	}
+	if alias.profile != "" {
+		opts.DeviceSpecific = map[string]any{"profile": alias.profile}
+	}
+	if alias.vidOverride != nil && opts.IdVendor == nil {
+		v := *alias.vidOverride
+		opts.IdVendor = &v
+	}
+	if alias.pidOverride != nil && opts.IdProduct == nil {
+		p := *alias.pidOverride
+		opts.IdProduct = &p
+	}
+	if alias.deprecationMsg != "" {
+		warnDeprecatedAlias(tn, alias.deprecationMsg)
+	}
+	return alias.registryName
 }
 
 // hiddenDeviceTypes are device types from the registry that should not appear
@@ -278,13 +365,10 @@ func viiper_device_add(busID C.uint32_t, typeName *C.char, outDeviceID *C.uint32
 	bid := uint32(busID)
 	tn := strings.ToLower(C.GoString(typeName))
 
-	// Resolve aliases (e.g. "steamdeck" -> "steamcontroller" with profile).
-	registryName := tn
+	// Resolve aliases — populates profile, VID/PID overrides, prints any
+	// deprecation warning once-per-process.
 	var opts device.CreateOptions
-	if alias, ok := deviceTypeAliases[tn]; ok {
-		registryName = alias.registryName
-		opts.DeviceSpecific = map[string]any{"profile": alias.profile}
-	}
+	registryName := applyAlias(tn, &opts)
 
 	reg := api.GetRegistration(registryName)
 	if reg == nil {
@@ -373,13 +457,9 @@ func viiper_device_add_ex(busID C.uint32_t, typeName *C.char, vid C.uint16_t, pi
 	bid := uint32(busID)
 	tn := strings.ToLower(C.GoString(typeName))
 
-	registryName := tn
+	// Explicit _ex arguments win over alias VID/PID overrides — apply them
+	// first so applyAlias's "only-set-if-unset" rule preserves them.
 	var opts device.CreateOptions
-	if alias, ok := deviceTypeAliases[tn]; ok {
-		registryName = alias.registryName
-		opts.DeviceSpecific = map[string]any{"profile": alias.profile}
-	}
-
 	if vid != 0 {
 		v := uint16(vid)
 		opts.IdVendor = &v
@@ -388,6 +468,7 @@ func viiper_device_add_ex(busID C.uint32_t, typeName *C.char, vid C.uint16_t, pi
 		p := uint16(pid)
 		opts.IdProduct = &p
 	}
+	registryName := applyAlias(tn, &opts)
 
 	reg := api.GetRegistration(registryName)
 	if reg == nil {
@@ -598,6 +679,28 @@ func viiper_device_set_input(busID C.uint32_t, deviceID C.uint32_t, data *C.uint
 		}
 		dse.UpdateInputState(&state)
 
+	case "dualsense":
+		ds, ok := info.dev.(*dualsense.DualSense)
+		if !ok {
+			return setError(fmt.Errorf("device type mismatch"))
+		}
+		var state dualsense.InputState
+		if err := state.UnmarshalBinary(buf); err != nil {
+			return setError(err)
+		}
+		ds.UpdateInputState(&state)
+
+	case "steamdeck":
+		sd, ok := info.dev.(*steamdeck.SteamDeck)
+		if !ok {
+			return setError(fmt.Errorf("device type mismatch"))
+		}
+		var state steamdeck.InputState
+		if err := state.UnmarshalBinary(buf); err != nil {
+			return setError(err)
+		}
+		sd.UpdateInputState(&state)
+
 	case "xboxelite2":
 		xe2, ok := info.dev.(*xboxelite2.XboxElite2)
 		if !ok {
@@ -628,23 +731,9 @@ func viiper_device_set_input(busID C.uint32_t, deviceID C.uint32_t, data *C.uint
 		if !ok {
 			return setError(fmt.Errorf("device type mismatch"))
 		}
-		// Steam controller reuses the shared Elite-2 wire format.
-		var state elite2state.InputState
-		var err error
-		switch len(buf) {
-		case elite2state.InputStateSize:
-			err = state.UnmarshalBinary(buf)
-		case elite2state.InputStateV1Size:
-			err = state.UnmarshalV1Binary(buf)
-		case elite2state.LegacyInputStateSize:
-			err = state.UnmarshalLegacyBinary(buf)
-		default:
-			err = fmt.Errorf(
-				"invalid steamcontroller input size: got %d (expected %d, %d, or %d)",
-				len(buf), elite2state.InputStateSize, elite2state.InputStateV1Size, elite2state.LegacyInputStateSize,
-			)
-		}
-		if err != nil {
+		// Gordon uses its native 64-byte input format.
+		var state steamcontroller.InputState
+		if err := state.UnmarshalBinary(buf); err != nil {
 			return setError(err)
 		}
 		sc.UpdateInputState(&state)
@@ -670,6 +759,21 @@ func viiper_device_set_input(busID C.uint32_t, deviceID C.uint32_t, data *C.uint
 			return setError(err)
 		}
 		xdev.UpdateInputState(&state)
+
+	case "ns2pro":
+		// Switch 2 Pro Controller: 27-byte wire (Buttons:u32, LX/LY/RX/RY:u16
+		// 12-bit native, Accel/Gyro:i16, batteryLevel:u8, charging:bool,
+		// externalPower:bool). UpdateInputState takes the InputState by value
+		// (not pointer) to match the port's API.
+		ns2, ok := info.dev.(*ns2pro.NS2Pro)
+		if !ok {
+			return setError(fmt.Errorf("device type mismatch"))
+		}
+		var state ns2pro.InputState
+		if err := state.UnmarshalBinary(buf); err != nil {
+			return setError(err)
+		}
+		ns2.UpdateInputState(state)
 
 	default:
 		return setError(fmt.Errorf("input not supported for device type: %s", info.typeName))
@@ -743,6 +847,32 @@ func viiper_device_set_feedback_callback(busID C.uint32_t, deviceID C.uint32_t, 
 			invokeFeedbackCallback(bid, did, data)
 		})
 
+	case "dualsense":
+		ds, ok := info.dev.(*dualsense.DualSense)
+		if !ok {
+			return setError(fmt.Errorf("device type mismatch"))
+		}
+		ds.SetOutputCallback(func(output dualsense.OutputState) {
+			data, err := output.MarshalBinary()
+			if err != nil {
+				return
+			}
+			invokeFeedbackCallback(bid, did, data)
+		})
+
+	case "steamdeck":
+		sd, ok := info.dev.(*steamdeck.SteamDeck)
+		if !ok {
+			return setError(fmt.Errorf("device type mismatch"))
+		}
+		sd.SetOutputCallback(func(output steamdeck.OutputState) {
+			data, err := output.MarshalBinary()
+			if err != nil {
+				return
+			}
+			invokeFeedbackCallback(bid, did, data)
+		})
+
 	case "xboxelite2":
 		xe2, ok := info.dev.(*xboxelite2.XboxElite2)
 		if !ok {
@@ -761,9 +891,7 @@ func viiper_device_set_feedback_callback(busID C.uint32_t, deviceID C.uint32_t, 
 		if !ok {
 			return setError(fmt.Errorf("device type mismatch"))
 		}
-		// Steam controller shares OutputState with xboxelite2 via the
-		// neutral elite2 wire-format package.
-		sc.SetOutputCallback(func(output elite2state.OutputState) {
+		sc.SetOutputCallback(func(output steamcontroller.OutputState) {
 			data, err := output.MarshalBinary()
 			if err != nil {
 				return
@@ -790,6 +918,19 @@ func viiper_device_set_feedback_callback(busID C.uint32_t, deviceID C.uint32_t, 
 			return setError(fmt.Errorf("device type mismatch"))
 		}
 		xdev.SetOutputCallback(func(output xboxgip.OutputState) {
+			data, err := output.MarshalBinary()
+			if err != nil {
+				return
+			}
+			invokeFeedbackCallback(bid, did, data)
+		})
+
+	case "ns2pro":
+		ns2, ok := info.dev.(*ns2pro.NS2Pro)
+		if !ok {
+			return setError(fmt.Errorf("device type mismatch"))
+		}
+		ns2.SetOutputCallback(func(output ns2pro.OutputState) {
 			data, err := output.MarshalBinary()
 			if err != nil {
 				return
