@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Alia5/VIIPER/device"
 	"github.com/Alia5/VIIPER/usb"
@@ -15,16 +16,25 @@ import (
 type DualShock4 struct {
 	inputState *InputState
 	stateMu    sync.Mutex
+	timeMu     sync.Mutex
 	outputFunc func(OutputState)
 	descriptor usb.Descriptor
+	now        func() time.Time
 
 	usbReportTimestamp uint32
 	usbPacketCounter   uint32
+	lastUSBReportAt    time.Time
 }
+
+// DS4 sensor timestamp unit is ~5.33us (3 units per 16us). A real controller's
+// field at full 1.25ms report rate steps by ~188. When no prior report exists we
+// seed with this nominal 1.25ms-equivalent step.
+const usbReportTimestampStep = 188
 
 func New(o *device.CreateOptions) (*DualShock4, error) {
 	d := &DualShock4{
 		descriptor: defaultDescriptor,
+		now:        time.Now,
 	}
 	if o != nil {
 		if o.IdVendor != nil {
@@ -59,6 +69,34 @@ func New(o *device.CreateOptions) (*DualShock4, error) {
 	}
 
 	return d, nil
+}
+
+// nextReportTimestamp advances the DS4 report timestamp (b[10:12]) by the REAL
+// elapsed time since the previous report, expressed in DS4 timestamp units of
+// ~5.33us (= 16/3 us, so units = elapsed_ns * 3 / 16000). The host integrates
+// gyro angle as velocity * delta-timestamp, so a flat +1 per report (the prior
+// behavior) told the host only ~5.33us elapsed between reports when at 125Hz
+// ~8000us actually passed — collapsing delta-t ~1500x and making integration
+// spike. Matches the DualSense device's time-based timestamp approach.
+func (d *DualShock4) nextReportTimestamp() uint16 {
+	d.timeMu.Lock()
+	defer d.timeMu.Unlock()
+
+	now := d.now()
+	step := uint32(usbReportTimestampStep)
+	if !d.lastUSBReportAt.IsZero() {
+		elapsed := now.Sub(d.lastUSBReportAt)
+		if elapsed < 0 {
+			elapsed = 0
+		}
+		computed := uint32((uint64(elapsed.Nanoseconds()) * 3) / 16000)
+		if computed > 0 {
+			step = computed
+		}
+	}
+	d.lastUSBReportAt = now
+
+	return uint16(atomic.AddUint32(&d.usbReportTimestamp, step))
 }
 
 func (d *DualShock4) SetOutputCallback(f func(OutputState)) {
@@ -224,8 +262,7 @@ func (d *DualShock4) buildUSBInputReport(s InputState) []byte {
 	b[8] = s.L2
 	b[9] = s.R2
 
-	ts := atomic.AddUint32(&d.usbReportTimestamp, 1)
-	binary.LittleEndian.PutUint16(b[10:12], uint16(ts))
+	binary.LittleEndian.PutUint16(b[10:12], d.nextReportTimestamp())
 
 	b[12] = 0x00
 
