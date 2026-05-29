@@ -246,9 +246,9 @@ func (s *InputState) buildReport(frame uint32, payloadLen byte) []byte {
 	gyroQuatX := s.GyroQuatX
 	gyroQuatY := s.GyroQuatY
 	gyroQuatZ := s.GyroQuatZ
-	if gyroQuatW == 0 && gyroQuatX == 0 && gyroQuatY == 0 && gyroQuatZ == 0 {
-		gyroQuatW = 0x4000
-	}
+	// Do NOT force an identity quaternion when unset. We don't advertise SendOrientation
+	// and never compute a live orientation, so leave the quaternion zero like InputPlumber's
+	// Steam Deck target — a frozen identity made Steam ignore our raw gyro velocity.
 	binary.LittleEndian.PutUint16(b[36:38], uint16(gyroQuatW))
 	binary.LittleEndian.PutUint16(b[38:40], uint16(gyroQuatX))
 	binary.LittleEndian.PutUint16(b[40:42], uint16(gyroQuatY))

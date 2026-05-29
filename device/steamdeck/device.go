@@ -52,7 +52,11 @@ var defaultSettings = map[uint8]uint16{
 	SettingRightTrackpadMode:          TrackpadModeNone,
 	SettingLizardMode:                 LizardModeOff,
 	SettingSmoothAbsoluteMouse:        0,
-	SettingIMUMode:                    GyroModeSendOrientation | GyroModeSendRawAccel | GyroModeSendRawGyro,
+	// Advertise raw gyro + raw accel only (no SendOrientation): we don't compute a live
+	// orientation quaternion, so claiming orientation made Steam lean on a frozen identity
+	// quat and ignore our raw angular velocity (gyro-to-stick collapsed to center). This
+	// matches InputPlumber's Steam Deck target, which sends raw gyro+accel and no quaternion.
+	SettingIMUMode:                    GyroModeSendRawAccel | GyroModeSendRawGyro,
 	SettingLeftTrackpadClickPressure:  0xffff,
 	SettingRightTrackpadClickPressure: 0xffff,
 	SettingSteamWatchdogEnable:        1,
@@ -63,7 +67,7 @@ var maxSettings = map[uint8]uint16{
 	SettingRightTrackpadMode:          TrackpadModeNone,
 	SettingLizardMode:                 LizardModeOn,
 	SettingSmoothAbsoluteMouse:        1,
-	SettingIMUMode:                    GyroModeSteering | GyroModeTilt | GyroModeSendOrientation | GyroModeSendRawAccel | GyroModeSendRawGyro,
+	SettingIMUMode:                    GyroModeSteering | GyroModeTilt | GyroModeSendRawAccel | GyroModeSendRawGyro,
 	SettingLeftTrackpadClickPressure:  0xffff,
 	SettingRightTrackpadClickPressure: 0xffff,
 	SettingSteamWatchdogEnable:        1,
