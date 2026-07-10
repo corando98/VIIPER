@@ -1,6 +1,7 @@
 package xboxgip
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -204,9 +205,12 @@ func (d *XboxGIP) UpdateInputState(state *InputState) {
 }
 
 // HandleTransfer implements the GIP protocol over interrupt IN/OUT endpoints.
-func (d *XboxGIP) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
+func (d *XboxGIP) HandleTransfer(ctx context.Context, ep uint32, dir uint32, out []byte) []byte {
 	d.logf("HandleTransfer ep=%d dir=%d outLen=%d", ep, dir, len(out))
 	if dir == usbip.DirIn && ep == 1 {
+		if device.GateCancelled == device.BlockUntilDeadline(ctx) {
+			return nil
+		}
 		return d.handleEPIn()
 	}
 	if dir == usbip.DirOut && ep == 1 {
@@ -223,6 +227,9 @@ func (d *XboxGIP) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
 	// EP2 IN: serve any queued auth responses, else NAK with a single zero
 	// byte so USBIP doesn't return an empty response.
 	if dir == usbip.DirIn && ep == 2 {
+		if device.GateCancelled == device.BlockUntilDeadline(ctx) {
+			return nil
+		}
 		select {
 		case resp := <-d.respQueueAuth:
 			d.logf("EP2 IN: queued auth resp len=%d hex=%X", len(resp), resp)
@@ -244,6 +251,9 @@ func (d *XboxGIP) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
 		return nil
 	}
 	if dir == usbip.DirIn && ep == 3 {
+		if device.GateCancelled == device.BlockUntilDeadline(ctx) {
+			return nil
+		}
 		// Silent NAK. Real chatpad/auth would return signed bytes here.
 		return []byte{0x00}
 	}

@@ -2,6 +2,7 @@
 package ns2pro
 
 import (
+	"context"
 	"encoding/binary"
 	"sync"
 	"unicode/utf16"
@@ -13,6 +14,7 @@ import (
 )
 
 type NS2Pro struct {
+	gate           *device.InputGate
 	stateMu    sync.Mutex
 	inputState *InputState
 	outputFunc func(OutputState)
@@ -33,6 +35,7 @@ type NS2Pro struct {
 
 func New(o *device.CreateOptions) (*NS2Pro, error) {
 	d := &NS2Pro{
+		gate: device.NewInputGate(),
 		inputState:     defaultInputState(),
 		descriptor:     MakeDescriptor(),
 		activeReportID: ReportIDPro,
@@ -58,13 +61,23 @@ func (d *NS2Pro) UpdateInputState(state InputState) {
 	d.stateMu.Lock()
 	defer d.stateMu.Unlock()
 	d.inputState = &state
+	d.gate.Signal()
 }
 
-func (d *NS2Pro) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
+func (d *NS2Pro) HandleTransfer(ctx context.Context, ep uint32, dir uint32, out []byte) []byte {
 	switch {
 	case dir == usbip.DirIn && ep == 1:
+		// Primary controller reports: block until fresh input or poll deadline.
+		if device.GateCancelled == d.gate.Wait(ctx) {
+			return nil
+		}
 		return d.nextInputReport()
 	case dir == usbip.DirIn && ep == 2:
+		// Bulk-IN reply queue: complete at the poll interval so an empty queue
+		// doesn't resubmit in a tight loop; return whatever is queued.
+		if device.GateCancelled == device.BlockUntilDeadline(ctx) {
+			return nil
+		}
 		return d.popBulkIn()
 	case dir == usbip.DirOut && ep == 1:
 		d.handleOutputReport(out)

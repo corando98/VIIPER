@@ -1,6 +1,7 @@
 package switchpro
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 // SwitchPro emulates a Nintendo Switch Pro Controller (or Joy-Con) virtual USB device.
 type SwitchPro struct {
+	gate           *device.InputGate
 	inputState   *InputState
 	stateMu      sync.Mutex
 	outputFunc   func(OutputState)
@@ -41,6 +43,7 @@ type switchProCreateOptions struct {
 
 func New(o *device.CreateOptions) (*SwitchPro, error) {
 	d := &SwitchPro{
+		gate: device.NewInputGate(),
 		descriptor: cloneDescriptor(defaultDescriptor),
 		profile:    ProfileProController,
 		inputState: &InputState{},
@@ -115,10 +118,11 @@ func (d *SwitchPro) UpdateInputState(state *InputState) {
 	d.stateMu.Lock()
 	defer d.stateMu.Unlock()
 	d.inputState = state
+	d.gate.Signal()
 }
 
 // HandleTransfer processes interrupt IN/OUT transfers for the virtual controller.
-func (d *SwitchPro) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
+func (d *SwitchPro) HandleTransfer(ctx context.Context, ep uint32, dir uint32, out []byte) []byte {
 	if dir == usbip.DirIn && ep == 1 {
 		// Check for pending subcommand/USB reply first.
 		d.pendingReplyMu.Lock()
@@ -128,6 +132,23 @@ func (d *SwitchPro) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
 
 		if reply != nil {
 			return reply
+		}
+
+		// No queued reply — block until fresh input (or poll deadline). A
+		// pending subcommand reply that arrives while we wait also signals
+		// the gate (see handleSubcommand), so it isn't starved.
+		switch d.gate.Wait(ctx) {
+		case device.GateCancelled:
+			return nil
+		case device.GateFresh, device.GateDeadline:
+			// Re-check for a reply queued while we were blocked.
+			d.pendingReplyMu.Lock()
+			reply = d.pendingReply
+			d.pendingReply = nil
+			d.pendingReplyMu.Unlock()
+			if reply != nil {
+				return reply
+			}
 		}
 
 		// Build standard 0x30 input report.

@@ -78,7 +78,7 @@ func TestInputReports(t *testing.T) {
 				return
 			}
 			dev.UpdateInputState(&tt.state)
-			got := dev.HandleTransfer(defaultControllerEndpoint, usbip.DirIn, nil)
+			got := dev.HandleTransfer(gateTestCtx(), defaultControllerEndpoint, usbip.DirIn, nil)
 			tt.validate(t, got)
 		})
 	}
@@ -102,7 +102,7 @@ func TestMotionFieldWireOrderMatchesSteamConsumers(t *testing.T) {
 		GyroQuatZ: 0x0aaa,
 	})
 
-	got := dev.HandleTransfer(defaultControllerEndpoint, usbip.DirIn, nil)
+	got := dev.HandleTransfer(gateTestCtx(), defaultControllerEndpoint, usbip.DirIn, nil)
 
 	// Linux hid-steam and SDL both decode the Steam Deck IMU report as X, Z, -Y.
 	// Keep the raw field order stable so higher-level HC translations can target it precisely.
@@ -427,7 +427,7 @@ func TestAPIStreamAndUSBInput(t *testing.T) {
 	cmd[4] = steamdeck.IntensityLong
 	cmd[5] = 0xf9
 	dev := b.GetAllDeviceMetas()[0].Dev
-	dev.HandleTransfer(defaultControllerEndpoint, usbip.DirOut, cmd)
+	dev.HandleTransfer(gateTestCtx(), defaultControllerEndpoint, usbip.DirOut, cmd)
 
 	var feedback [steamdeck.InputReportLen]byte
 	_ = stream.SetReadDeadline(time.Now().Add(750 * time.Millisecond))
@@ -437,4 +437,15 @@ func TestAPIStreamAndUSBInput(t *testing.T) {
 	}
 	assert.Equal(t, byte(steamdeck.FeatureTriggerHapticCommand), feedback[0])
 	assert.Equal(t, byte(steamdeck.CommandTypeClick), feedback[3])
+}
+
+// gateTestCtx returns a context with a short deadline so gated interrupt-IN
+// HandleTransfer calls in tests never block: a signalled input gate completes
+// immediately (GateFresh), an unsignalled one completes at the deadline
+// (GateDeadline) — both build a report from current state. (Port of upstream
+// data-driven completion, 7e33d2d3.)
+func gateTestCtx() context.Context {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	_ = cancel
+	return ctx
 }

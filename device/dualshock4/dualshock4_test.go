@@ -348,7 +348,7 @@ func TestInputReports(t *testing.T) {
 				return
 			}
 			dev.UpdateInputState(&tc.inputState)
-			built := dev.HandleTransfer(4, usbip.DirIn, nil)
+			built := dev.HandleTransfer(gateTestCtx(), 4, usbip.DirIn, nil)
 			bb := append([]byte(nil), built...)
 			exp := append([]byte(nil), tc.expectedReport...)
 			bb[7] &= 0x03
@@ -471,4 +471,15 @@ func TestFeedback(t *testing.T) {
 			assert.Equal(t, tc.outputState, got)
 		})
 	}
+}
+
+// gateTestCtx returns a context with a short deadline so gated interrupt-IN
+// HandleTransfer calls in tests never block: a signalled input gate completes
+// immediately (GateFresh), an unsignalled one completes at the deadline
+// (GateDeadline) — both build a report from current state. (Port of upstream
+// data-driven completion, 7e33d2d3.)
+func gateTestCtx() context.Context {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	_ = cancel
+	return ctx
 }

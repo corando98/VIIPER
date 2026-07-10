@@ -2,6 +2,7 @@
 package keyboard
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 
@@ -13,6 +14,7 @@ import (
 
 // Keyboard implements the Device interface for a full HID keyboard with LED support.
 type Keyboard struct {
+	gate       *device.InputGate
 	tick        uint64
 	inputState  *InputState
 	stateMu     sync.Mutex
@@ -24,6 +26,7 @@ type Keyboard struct {
 // New returns a new Keyboard device.
 func New(o *device.CreateOptions) (*Keyboard, error) {
 	d := &Keyboard{
+		gate: device.NewInputGate(),
 		descriptor: defaultDescriptor,
 	}
 	if o != nil {
@@ -60,13 +63,17 @@ func (k *Keyboard) UpdateInputState(state InputState) {
 	k.stateMu.Lock()
 	defer k.stateMu.Unlock()
 	k.inputState = &state
+	k.gate.Signal()
 }
 
 // HandleTransfer implements interrupt IN/OUT for Keyboard.
-func (k *Keyboard) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
+func (k *Keyboard) HandleTransfer(ctx context.Context, ep uint32, dir uint32, out []byte) []byte {
 	if dir == usbip.DirIn {
 		switch ep {
 		case 1: // 0x81 - keyboard input reports
+			if device.GateCancelled == k.gate.Wait(ctx) {
+				return nil
+			}
 			atomic.AddUint64(&k.tick, 1)
 
 			k.stateMu.Lock()

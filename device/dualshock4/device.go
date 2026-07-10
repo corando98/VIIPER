@@ -1,6 +1,7 @@
 package dualshock4
 
 import (
+	"context"
 	"encoding/binary"
 	"log/slog"
 	"sync"
@@ -14,6 +15,7 @@ import (
 )
 
 type DualShock4 struct {
+	gate *device.InputGate
 	inputState *InputState
 	stateMu    sync.Mutex
 	timeMu     sync.Mutex
@@ -33,6 +35,7 @@ const usbReportTimestampStep = 188
 
 func New(o *device.CreateOptions) (*DualShock4, error) {
 	d := &DualShock4{
+		gate: device.NewInputGate(),
 		descriptor: defaultDescriptor,
 		now:        time.Now,
 	}
@@ -107,12 +110,16 @@ func (d *DualShock4) UpdateInputState(state *InputState) {
 	d.stateMu.Lock()
 	defer d.stateMu.Unlock()
 	d.inputState = state
+	d.gate.Signal()
 }
 
-func (d *DualShock4) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
+func (d *DualShock4) HandleTransfer(ctx context.Context, ep uint32, dir uint32, out []byte) []byte {
 	if dir == usbip.DirIn {
 		switch ep {
 		case 4:
+			if device.GateCancelled == d.gate.Wait(ctx) {
+				return nil
+			}
 			d.stateMu.Lock()
 			st := *d.inputState
 			d.stateMu.Unlock()

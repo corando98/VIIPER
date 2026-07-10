@@ -1,6 +1,7 @@
 package steamcontroller
 
 import (
+	"context"
 	"encoding/binary"
 	"sync"
 	"sync/atomic"
@@ -60,6 +61,7 @@ const (
 )
 
 type SteamController struct {
+	gate           *device.InputGate
 	inputState          *InputState
 	stateMu             sync.Mutex
 	featureMu           sync.Mutex
@@ -127,6 +129,7 @@ func newControllerState() controllerState {
 
 func New(o *device.CreateOptions) (*SteamController, error) {
 	d := &SteamController{
+		gate: device.NewInputGate(),
 		descriptor: defaultDescriptor,
 		inputState: &InputState{},
 		controller: newControllerState(),
@@ -166,11 +169,13 @@ func (d *SteamController) UpdateInputState(state *InputState) {
 	defer d.stateMu.Unlock()
 	if state == nil {
 		d.inputState = &InputState{}
+		d.gate.Signal()
 		return
 	}
 	st := *state
 	st.Frame = atomic.AddUint32(&d.frame, 1)
 	d.inputState = &st
+	d.gate.Signal()
 }
 
 func (d *SteamController) buildInputReport(st InputState, frame uint32) []byte {
@@ -196,17 +201,26 @@ func (d *SteamController) buildInputReport(st InputState, frame uint32) []byte {
 	return report
 }
 
-func (d *SteamController) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
+func (d *SteamController) HandleTransfer(ctx context.Context, ep uint32, dir uint32, out []byte) []byte {
 	if dir == usbip.DirIn {
 		switch ep {
 		case mouseEndpointNumber:
+			if device.GateCancelled == device.BlockUntilDeadline(ctx) {
+				return nil
+			}
 			return append([]byte(nil), zeroMouseReport...)
 		case keyboardEndpointNumber:
+			if device.GateCancelled == device.BlockUntilDeadline(ctx) {
+				return nil
+			}
 			d.stateMu.Lock()
 			st := *d.inputState
 			d.stateMu.Unlock()
 			return d.buildLizardKeyboardReport(st)
 		case controllerEndpointNumber:
+			if device.GateCancelled == d.gate.Wait(ctx) {
+				return nil
+			}
 			d.stateMu.Lock()
 			st := *d.inputState
 			d.stateMu.Unlock()

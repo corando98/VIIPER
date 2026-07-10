@@ -1,6 +1,7 @@
 package xboxelite2
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 )
 
 type XboxElite2 struct {
+	gate       *device.InputGate
 	inputState *elite2state.InputState
 	stateMu    sync.Mutex
 	outputFunc func(elite2state.OutputState)
@@ -28,6 +30,7 @@ type xboxElite2CreateOptions struct {
 
 func New(o *device.CreateOptions) (*XboxElite2, error) {
 	d := &XboxElite2{
+		gate: device.NewInputGate(),
 		descriptor: cloneDescriptor(defaultDescriptor),
 		profile:    ProfileElite2,
 	}
@@ -208,12 +211,16 @@ func (x *XboxElite2) UpdateInputState(state *elite2state.InputState) {
 	x.stateMu.Lock()
 	defer x.stateMu.Unlock()
 	x.inputState = state
+	x.gate.Signal()
 }
 
-func (x *XboxElite2) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
+func (x *XboxElite2) HandleTransfer(ctx context.Context, ep uint32, dir uint32, out []byte) []byte {
 	if dir == usbip.DirIn {
 		switch ep {
 		case 1: // 0x81 - main input reports
+			if device.GateCancelled == x.gate.Wait(ctx) {
+				return nil
+			}
 			x.stateMu.Lock()
 			var st elite2state.InputState
 			if x.inputState != nil {

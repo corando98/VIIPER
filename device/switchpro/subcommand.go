@@ -54,6 +54,7 @@ func (d *SwitchPro) handleUSBCommand(data []byte) {
 	d.pendingReplyMu.Lock()
 	d.pendingReply = reply
 	d.pendingReplyMu.Unlock()
+	d.gate.Signal()
 }
 
 // handleSubcommand processes subcommand output reports (0x01).
@@ -110,6 +111,7 @@ func (d *SwitchPro) handleSubcommand(data []byte) {
 	d.pendingReplyMu.Lock()
 	d.pendingReply = reply
 	d.pendingReplyMu.Unlock()
+	d.gate.Signal()
 }
 
 // buildSubcmdReply builds a 0x21 subcommand reply report (64 bytes).

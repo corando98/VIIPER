@@ -2,6 +2,7 @@
 package mouse
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 
@@ -14,6 +15,7 @@ import (
 // Mouse implements the minimal Device interface for a 5-button HID mouse
 // with vertical and horizontal wheels.
 type Mouse struct {
+	gate       *device.InputGate
 	tick       uint64
 	inputState *InputState
 	stateMu    sync.Mutex
@@ -23,6 +25,7 @@ type Mouse struct {
 // New returns a new Mouse device.
 func New(o *device.CreateOptions) (*Mouse, error) {
 	d := &Mouse{
+		gate: device.NewInputGate(),
 		descriptor: defaultDescriptor,
 	}
 	if o != nil {
@@ -41,13 +44,17 @@ func (m *Mouse) UpdateInputState(state InputState) {
 	m.stateMu.Lock()
 	defer m.stateMu.Unlock()
 	m.inputState = &state
+	m.gate.Signal()
 }
 
 // HandleTransfer implements interrupt IN for Mouse.
-func (m *Mouse) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
+func (m *Mouse) HandleTransfer(ctx context.Context, ep uint32, dir uint32, out []byte) []byte {
 	if dir == usbip.DirIn {
 		switch ep {
 		case 1: // 0x81 - main input reports
+			if device.GateCancelled == m.gate.Wait(ctx) {
+				return nil
+			}
 			atomic.AddUint64(&m.tick, 1)
 
 			m.stateMu.Lock()

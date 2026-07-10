@@ -2,6 +2,7 @@
 package xbox360
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -13,6 +14,7 @@ import (
 )
 
 type Xbox360 struct {
+	gate       *device.InputGate
 	tick       uint64
 	inputState *InputState
 	stateMu    sync.Mutex
@@ -27,6 +29,7 @@ type Xbox360CreateOptions struct {
 // New returns a new Xbox360 device.
 func New(o *device.CreateOptions) (*Xbox360, error) {
 	d := &Xbox360{
+		gate: device.NewInputGate(),
 		descriptor: MakeDescriptor(),
 	}
 	if o != nil {
@@ -64,13 +67,17 @@ func (x *Xbox360) UpdateInputState(state InputState) {
 	x.stateMu.Lock()
 	defer x.stateMu.Unlock()
 	x.inputState = &state
+	x.gate.Signal()
 }
 
 // HandleTransfer implements interrupt IN/OUT for Xbox360.
-func (x *Xbox360) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
+func (x *Xbox360) HandleTransfer(ctx context.Context, ep uint32, dir uint32, out []byte) []byte {
 	if dir == usbip.DirIn {
 		switch ep {
 		case 1: // 0x81 - main input reports
+			if device.GateCancelled == x.gate.Wait(ctx) {
+				return nil
+			}
 			atomic.AddUint64(&x.tick, 1)
 
 			x.stateMu.Lock()

@@ -1,6 +1,7 @@
 package steamdeck
 
 import (
+	"context"
 	"encoding/binary"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,7 @@ var zeroMouseReport = []byte{0x00, 0x00, 0x00, 0x00}
 var zeroKeyboardReport = []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
 
 type SteamDeck struct {
+	gate           *device.InputGate
 	inputState          *InputState
 	stateMu             sync.Mutex
 	featureMu           sync.Mutex
@@ -109,6 +111,7 @@ func cloneDescriptor() usb.Descriptor {
 
 func New(o *device.CreateOptions) (*SteamDeck, error) {
 	d := &SteamDeck{
+		gate: device.NewInputGate(),
 		descriptor: cloneDescriptor(),
 		inputState: &InputState{},
 		controller: newControllerState(),
@@ -133,21 +136,32 @@ func (d *SteamDeck) UpdateInputState(state *InputState) {
 	defer d.stateMu.Unlock()
 	if state == nil {
 		d.inputState = &InputState{}
+		d.gate.Signal()
 		return
 	}
 	st := *state
 	st.Frame = atomic.AddUint32(&d.frame, 1)
 	d.inputState = &st
+	d.gate.Signal()
 }
 
-func (d *SteamDeck) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
+func (d *SteamDeck) HandleTransfer(ctx context.Context, ep uint32, dir uint32, out []byte) []byte {
 	if dir == usbip.DirIn {
 		switch ep {
 		case mouseEndpointNumber:
+			if device.GateCancelled == device.BlockUntilDeadline(ctx) {
+				return nil
+			}
 			return append([]byte(nil), zeroMouseReport...)
 		case keyboardEndpointNumber:
+			if device.GateCancelled == device.BlockUntilDeadline(ctx) {
+				return nil
+			}
 			return append([]byte(nil), zeroKeyboardReport...)
 		case controllerEndpointNumber:
+			if device.GateCancelled == d.gate.Wait(ctx) {
+				return nil
+			}
 			d.stateMu.Lock()
 			st := *d.inputState
 			d.stateMu.Unlock()

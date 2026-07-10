@@ -1,6 +1,7 @@
 package dualsenseedge
 
 import (
+	"context"
 	"encoding/binary"
 	"log/slog"
 	"sync"
@@ -12,6 +13,7 @@ import (
 )
 
 type DualSenseEdge struct {
+	gate *device.InputGate
 	inputState *InputState
 	stateMu    sync.Mutex
 	outputFunc func(OutputState)
@@ -27,6 +29,7 @@ type DualSenseEdge struct {
 
 func New(o *device.CreateOptions) (*DualSenseEdge, error) {
 	d := &DualSenseEdge{
+		gate: device.NewInputGate(),
 		descriptor: defaultDescriptor,
 	}
 	if o != nil {
@@ -55,12 +58,16 @@ func (d *DualSenseEdge) UpdateInputState(state *InputState) {
 	d.stateMu.Lock()
 	defer d.stateMu.Unlock()
 	d.inputState = state
+	d.gate.Signal()
 }
 
-func (d *DualSenseEdge) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
+func (d *DualSenseEdge) HandleTransfer(ctx context.Context, ep uint32, dir uint32, out []byte) []byte {
 	if dir == usbip.DirIn {
 		switch ep {
 		case 4:
+			if device.GateCancelled == d.gate.Wait(ctx) {
+				return nil
+			}
 			d.stateMu.Lock()
 			st := *d.inputState
 			d.stateMu.Unlock()

@@ -1,6 +1,7 @@
 package dualsense
 
 import (
+	"context"
 	"encoding/binary"
 	"log/slog"
 	"sync"
@@ -14,6 +15,7 @@ import (
 )
 
 type DualSense struct {
+	gate *device.InputGate
 	inputState *InputState
 	stateMu    sync.Mutex
 	timeMu     sync.Mutex
@@ -30,6 +32,7 @@ const usbSensorTimestampStep = 12000
 
 func New(o *device.CreateOptions) (*DualSense, error) {
 	d := &DualSense{
+		gate: device.NewInputGate(),
 		descriptor: defaultDescriptor,
 		now:        time.Now,
 		inputState: &InputState{},
@@ -54,15 +57,20 @@ func (d *DualSense) UpdateInputState(state *InputState) {
 	defer d.stateMu.Unlock()
 	if state == nil {
 		d.inputState = &InputState{}
+		d.gate.Signal()
 		return
 	}
 	d.inputState = state
+	d.gate.Signal()
 }
 
-func (d *DualSense) HandleTransfer(ep uint32, dir uint32, out []byte) []byte {
+func (d *DualSense) HandleTransfer(ctx context.Context, ep uint32, dir uint32, out []byte) []byte {
 	if dir == usbip.DirIn {
 		switch ep {
 		case 4:
+			if device.GateCancelled == d.gate.Wait(ctx) {
+				return nil
+			}
 			d.stateMu.Lock()
 			st := *d.inputState
 			d.stateMu.Unlock()

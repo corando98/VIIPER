@@ -6,10 +6,19 @@ const (
 )
 
 const (
-	DefaultProfile      = "steamdeck"
-	InputReportID       = 0x09
-	InputReportLen      = 64
-	DeckInputPayloadLen = 56
+	DefaultProfile = "steamdeck"
+	InputReportID  = 0x09
+	InputReportLen = 64
+	// SDL3's HIDAPI Steam Deck driver hard-equality checks
+	// header.ucLength == 64 at report ingress
+	// (SDL/src/joystick/hidapi/SDL_hidapi_steamdeck.c
+	// HIDAPI_DriverSteamDeck_UpdateDevice). Writing 56 (the payload-only
+	// length used by the pre-Deck Steam Controller) caused SDL3 to silently
+	// drop every frame, so sticks/gyro/accel all read as zero downstream
+	// (verified live 2026-05-31 against SdlGyroTester with a virtual
+	// Steam Deck target — sensors=True at HasSensor, GetSensorData=0,0,0).
+	// Match the full report length here.
+	DeckInputPayloadLen = 64
 )
 
 const (

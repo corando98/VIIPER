@@ -3,6 +3,7 @@ package usb
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -589,6 +590,64 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
 		return fmt.Errorf("no device context available from bus")
 	}
 
+	// Data-driven completion plumbing (ported from upstream 7e33d2d3):
+	// interrupt-IN URBs are completed asynchronously when the device has
+	// FRESH input (device HandleTransfer blocks on its input channel), so
+	// completions can interleave with the synchronous EP0/OUT path below —
+	// writeRet serializes the wire writes.
+	var writeMu sync.Mutex
+	var retOut bytes.Buffer
+	retOut.Grow(retSubmitHeaderSize)
+	writeRet := func(seq uint32, status int32, actualLen uint32, respData []byte, flush bool) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		ret := usbip.RetSubmit{
+			Basic:           usbip.HeaderBasic{Command: usbip.RetSubmitCode, Seqnum: seq, Devid: 0, Dir: 0, Ep: 0},
+			Status:          status,
+			ActualLength:    actualLen,
+			StartFrame:      0,
+			NumberOfPackets: 0,
+			ErrorCount:      0,
+		}
+		retOut.Reset()
+		if err := ret.Write(&retOut); err != nil {
+			return fmt.Errorf("build RET_SUBMIT header: %w", err)
+		}
+		if _, err := writer.Write(retOut.Bytes()); err != nil {
+			return fmt.Errorf("write RET_SUBMIT: %w", err)
+		}
+		if len(respData) > 0 {
+			if _, err := writer.Write(respData); err != nil {
+				return fmt.Errorf("write RET_SUBMIT payload: %w", err)
+			}
+		}
+		if flush && bw != nil {
+			if err := bw.Flush(); err != nil {
+				return fmt.Errorf("flush response: %w", err)
+			}
+		}
+		return nil
+	}
+
+	// In-flight interrupt-IN URBs by seqnum, so UNLINK can cancel them.
+	var pendingMu sync.Mutex
+	pending := map[uint32]context.CancelFunc{}
+	defer func() {
+		pendingMu.Lock()
+		for _, cancel := range pending {
+			cancel()
+		}
+		pendingMu.Unlock()
+	}()
+
+	// Last completed IN payload per endpoint — replayed when the endpoint's
+	// bInterval elapses with no fresh input so the host still sees its
+	// poll-rate keepalive.
+	var respMu sync.Mutex
+	lastInResp := map[uint32][]byte{}
+
+	var outPayloadScratch []byte
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -637,9 +696,26 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
 		if cmd == usbip.CmdUnlinkCode {
 			unlinkSeq := binary.BigEndian.Uint32(hdr[urbHdrOffsetUnlink : urbHdrOffsetUnlink+4])
 			s.logger.Debug("USBIP_CMD_UNLINK", "seq", seq, "unlink", unlinkSeq)
-			// Reply with -ECONNRESET
-			ret := usbip.RetUnlink{Basic: usbip.HeaderBasic{Command: usbip.RetUnlinkCode, Seqnum: seq, Devid: 0, Dir: 0, Ep: 0}, Status: errConnReset}
+			pendingMu.Lock()
+			cancel, found := pending[unlinkSeq]
+			if found {
+				delete(pending, unlinkSeq)
+			}
+			pendingMu.Unlock()
+			// -ECONNRESET signals the URB was unlinked before completion;
+			// status 0 means it already completed normally.
+			status := int32(0)
+			if found {
+				cancel()
+				status = errConnReset
+			}
+			ret := usbip.RetUnlink{Basic: usbip.HeaderBasic{Command: usbip.RetUnlinkCode, Seqnum: seq, Devid: 0, Dir: 0, Ep: 0}, Status: status}
+			writeMu.Lock()
 			_ = ret.Write(writer)
+			if bw != nil {
+				_ = bw.Flush()
+			}
+			writeMu.Unlock()
 			continue
 		}
 		if cmd != usbip.CmdSubmitCode {
@@ -651,13 +727,78 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
 
 		var outPayload []byte
 		if dir == usbip.DirOut && xferLen > 0 {
-			outPayload = make([]byte, xferLen)
+			if cap(outPayloadScratch) < int(xferLen) {
+				outPayloadScratch = make([]byte, xferLen)
+			}
+			outPayload = outPayloadScratch[:xferLen]
 			if err := usbip.ReadExactly(conn, outPayload); err != nil {
 				return fmt.Errorf("read OUT payload: %w", err)
 			}
 		}
 
-		respData := s.processSubmit(dev, ep, dir, setup, outPayload)
+		if dir == usbip.DirIn && ep != 0 {
+			// Data-driven interrupt-IN: complete asynchronously when the
+			// device produces FRESH input. The device blocks on its input
+			// channel up to the endpoint's bInterval; on deadline we replay
+			// the last payload for this endpoint (host keepalive).
+			urbCtx, urbCancel := context.WithCancel(ctx)
+			pendingMu.Lock()
+			pending[seq] = urbCancel
+			pendingMu.Unlock()
+			interval := endpointInterval(dev.GetDescriptor(), ep)
+
+			go func(seq, ep, dir uint32) {
+				defer urbCancel()
+				var respData []byte
+				for {
+					attemptCtx, attemptCancel := urbCtx, context.CancelFunc(func() {})
+					if interval > 0 {
+						attemptCtx, attemptCancel = context.WithTimeout(urbCtx, interval)
+					}
+					respData = s.processSubmit(attemptCtx, dev, ep, dir, nil, nil)
+					expired := respData == nil && errors.Is(attemptCtx.Err(), context.DeadlineExceeded)
+					attemptCancel()
+
+					if urbCtx.Err() != nil {
+						return
+					}
+					if respData != nil {
+						respMu.Lock()
+						lastInResp[ep] = append([]byte(nil), respData...)
+						respMu.Unlock()
+						break
+					}
+					if expired {
+						respMu.Lock()
+						cached, ok := lastInResp[ep]
+						respMu.Unlock()
+						if ok {
+							respData = cached
+							break
+						}
+						continue
+					}
+					// Device answered "no data" without blocking.
+					break
+				}
+
+				pendingMu.Lock()
+				delete(pending, seq)
+				pendingMu.Unlock()
+
+				if err := writeRet(seq, 0, uint32(len(respData)), respData, true); err != nil {
+					if isClientDisconnect(err) {
+						s.logger.Debug("URB completion after disconnect", "seq", seq, "error", err)
+					} else {
+						s.logger.Error("write async RET_SUBMIT", "seq", seq, "error", err)
+					}
+				}
+			}(seq, ep, dir)
+			continue
+		}
+
+		// EP0 and OUT transfers never block and are handled in order.
+		respData := s.processSubmit(ctx, dev, ep, dir, setup, outPayload)
 
 		// STALL (EPIPE) when GET_DESCRIPTOR returns no data — required by USB spec
 		// for unsupported descriptor types (e.g. device_qualifier for full-speed devices).
@@ -675,31 +816,27 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
 		if dir == usbip.DirOut {
 			actualLen = uint32(len(outPayload))
 		}
-
-		ret := usbip.RetSubmit{
-			Basic:           usbip.HeaderBasic{Command: usbip.RetSubmitCode, Seqnum: seq, Devid: 0, Dir: 0, Ep: 0},
-			Status:          urbStatus,
-			ActualLength:    actualLen,
-			StartFrame:      0,
-			NumberOfPackets: 0,
-			ErrorCount:      0,
-		}
-		var out bytes.Buffer
-		out.Grow(retSubmitHeaderSize)
-		if err := ret.Write(&out); err != nil {
-			return fmt.Errorf("build RET_SUBMIT header: %w", err)
-		}
-		if _, err := writer.Write(out.Bytes()); err != nil {
-			return fmt.Errorf("write RET_SUBMIT: %w", err)
-		}
-		if len(respData) > 0 {
-			if _, err := writer.Write(respData); err != nil {
-				return fmt.Errorf("write RET_SUBMIT payload: %w", err)
-			}
+		if err := writeRet(seq, urbStatus, actualLen, respData, ep == 0); err != nil {
+			return err
 		}
 		_ = xferFlags
 		_ = devid
 	}
+}
+
+// endpointInterval returns the polling interval of the given interrupt IN
+// endpoint (from its descriptor's bInterval), or 0 when unknown.
+func endpointInterval(desc *usb.Descriptor, ep uint32) time.Duration {
+	epAddr := uint8(ep) | 0x80
+	for i := range desc.Interfaces {
+		for _, epDesc := range desc.Interfaces[i].Endpoints {
+			if epDesc.BEndpointAddress != epAddr || epDesc.BMAttributes&0x03 != 0x03 {
+				continue
+			}
+			return time.Duration(epDesc.BInterval) * time.Millisecond
+		}
+	}
+	return 0
 }
 
 // isClientDisconnect tests whether an error represents a normal client
@@ -729,9 +866,9 @@ func isClientDisconnect(err error) bool {
 	return false
 }
 
-func (s *Server) processSubmit(dev usb.Device, ep uint32, dir uint32, setup []byte, out []byte) []byte {
+func (s *Server) processSubmit(ctx context.Context, dev usb.Device, ep uint32, dir uint32, setup []byte, out []byte) []byte {
 	if ep != 0 {
-		return dev.HandleTransfer(ep, dir, out)
+		return dev.HandleTransfer(ctx, ep, dir, out)
 	}
 	if len(setup) != 8 {
 		return nil
