@@ -8,4 +8,10 @@ type ServerConfig struct {
 	ConnectionTimeout       time.Duration `kong:"-"`
 	BusCleanupTimeout       time.Duration `help:"-"`
 	WriteBatchFlushInterval time.Duration `help:"Interval to flush write batches to clients; 0 to disable" default:"0" env:"VIIPER_USB_WRITE_BATCH_FLUSH_INTERVAL"`
+	// HardwarePacedCompletions completes interrupt-IN URBs at each endpoint's
+	// bInterval (like real USB hardware polls) instead of once per input
+	// update. Input state is conflated latest-wins between completions. At
+	// input rates above the poll rate this proportionally cuts TCP round
+	// trips and kernel URB work; below the poll rate behavior is unchanged.
+	HardwarePacedCompletions bool `help:"Pace interrupt-IN completions to the endpoint bInterval instead of per input update" default:"false" env:"VIIPER_HW_PACED"`
 }

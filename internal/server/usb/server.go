@@ -661,11 +661,43 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
 	startInWorker := func(ep uint32) chan inJob {
 		jobs := make(chan inJob, 8)
 		interval := endpointInterval(dev.GetDescriptor(), ep)
+		hwPaced := s.config.HardwarePacedCompletions && interval > 0
 		go func() {
 			var frame bytes.Buffer
 			var last []byte
 			haveLast := false
+			// Hardware pacing: completions are held to the endpoint's poll
+			// cadence (anchored, drift-free). The input gate coalesces
+			// updates that land between polls, latest state wins — the same
+			// thing a real controller's bInterval does.
+			var nextDue time.Time
+			var pacer *time.Timer
+			if hwPaced {
+				pacer = time.NewTimer(time.Hour)
+				if !pacer.Stop() {
+					<-pacer.C
+				}
+			}
 			for job := range jobs {
+				if hwPaced {
+					now := time.Now()
+					if !nextDue.IsZero() && nextDue.After(now) {
+						pacer.Reset(nextDue.Sub(now))
+						select {
+						case <-pacer.C:
+						case <-job.ctx.Done():
+							if !pacer.Stop() {
+								<-pacer.C
+							}
+						}
+					}
+					now = time.Now()
+					if nextDue.IsZero() || nextDue.Add(interval).Before(now) {
+						nextDue = now.Add(interval)
+					} else {
+						nextDue = nextDue.Add(interval)
+					}
+				}
 				var respData []byte
 				for {
 					attemptCtx, attemptCancel := job.ctx, context.CancelFunc(func() {})

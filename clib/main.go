@@ -296,6 +296,8 @@ func viiper_init(listenAddr *C.char) C.int {
 		ConnectionTimeout:       30 * time.Second,
 		BusCleanupTimeout:       5 * time.Second,
 		WriteBatchFlushInterval: 0, // immediate writes — data-driven completion makes batching counterproductive
+		// Opt-in via env for now; flip the default if benchmarks confirm.
+		HardwarePacedCompletions: os.Getenv("VIIPER_HW_PACED") == "1",
 	}
 
 	server = usbsrv.New(cfg, logger, nil)
