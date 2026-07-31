@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"strings"
 	"sync"
 	"time"
@@ -230,6 +231,42 @@ func viiper_last_error() *C.char {
 // Lifecycle
 // ---------------------------------------------------------------------------
 
+// CPU profiling hook: when VIIPER_CPUPROFILE is set, every init/shutdown
+// cycle writes one pprof file "<value>.<n>" (n increments per cycle, so
+// benchmark iterations don't overwrite each other).
+var (
+	cpuProfileFile  *os.File
+	cpuProfileCount int
+)
+
+func maybeStartCPUProfile() {
+	base := os.Getenv("VIIPER_CPUPROFILE")
+	if base == "" {
+		return
+	}
+	cpuProfileCount++
+	f, err := os.Create(fmt.Sprintf("%s.%d", base, cpuProfileCount))
+	if err != nil {
+		slog.Error("cpuprofile: create failed", "error", err)
+		return
+	}
+	if err := pprof.StartCPUProfile(f); err != nil {
+		slog.Error("cpuprofile: start failed", "error", err)
+		_ = f.Close()
+		return
+	}
+	cpuProfileFile = f
+}
+
+func maybeStopCPUProfile() {
+	if cpuProfileFile == nil {
+		return
+	}
+	pprof.StopCPUProfile()
+	_ = cpuProfileFile.Close()
+	cpuProfileFile = nil
+}
+
 //export viiper_init
 func viiper_init(listenAddr *C.char) C.int {
 	mu.Lock()
@@ -272,6 +309,8 @@ func viiper_init(listenAddr *C.char) C.int {
 	// Wait for the server to be ready (listener bound).
 	<-server.Ready()
 
+	maybeStartCPUProfile()
+
 	return 0
 }
 
@@ -291,6 +330,8 @@ func viiper_shutdown() {
 
 	_ = server.Close()
 	server = nil
+
+	maybeStopCPUProfile()
 
 	// Clear device tracking.
 	devices = make(map[deviceKey]*deviceInfo)

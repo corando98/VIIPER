@@ -640,11 +640,103 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
 		pendingMu.Unlock()
 	}()
 
-	// Last completed IN payload per endpoint — replayed when the endpoint's
-	// bInterval elapses with no fresh input so the host still sees its
-	// poll-rate keepalive.
-	var respMu sync.Mutex
-	lastInResp := map[uint32][]byte{}
+	// Persistent per-endpoint completion workers: one goroutine per
+	// interrupt-IN endpoint for the lifetime of the URB stream, fed by a
+	// small job queue, instead of one goroutine per URB. Each worker owns a
+	// reusable frame buffer (RET_SUBMIT header + payload assembled and
+	// written as a single syscall) and its endpoint's last-response cache
+	// (replayed on bInterval expiry with no fresh input, so the host still
+	// sees its poll-rate keepalive).
+	type inJob struct {
+		seq    uint32
+		ctx    context.Context
+		cancel context.CancelFunc
+	}
+	inWorkers := map[uint32]chan inJob{}
+	defer func() {
+		for _, ch := range inWorkers {
+			close(ch)
+		}
+	}()
+	startInWorker := func(ep uint32) chan inJob {
+		jobs := make(chan inJob, 8)
+		interval := endpointInterval(dev.GetDescriptor(), ep)
+		go func() {
+			var frame bytes.Buffer
+			var last []byte
+			haveLast := false
+			for job := range jobs {
+				var respData []byte
+				for {
+					attemptCtx, attemptCancel := job.ctx, context.CancelFunc(func() {})
+					if interval > 0 {
+						attemptCtx, attemptCancel = context.WithTimeout(job.ctx, interval)
+					}
+					respData = s.processSubmit(attemptCtx, dev, ep, usbip.DirIn, nil, nil)
+					expired := respData == nil && errors.Is(attemptCtx.Err(), context.DeadlineExceeded)
+					attemptCancel()
+
+					if job.ctx.Err() != nil {
+						respData = nil
+						break
+					}
+					if respData != nil {
+						last = append(last[:0], respData...)
+						haveLast = true
+						break
+					}
+					if expired {
+						if haveLast {
+							respData = last
+							break
+						}
+						continue
+					}
+					// Device answered "no data" without blocking.
+					break
+				}
+
+				pendingMu.Lock()
+				delete(pending, job.seq)
+				pendingMu.Unlock()
+				job.cancel()
+
+				if job.ctx.Err() != nil && respData == nil {
+					// Unlinked or stream torn down mid-wait: no completion.
+					continue
+				}
+
+				frame.Reset()
+				ret := usbip.RetSubmit{
+					Basic:           usbip.HeaderBasic{Command: usbip.RetSubmitCode, Seqnum: job.seq, Devid: 0, Dir: 0, Ep: 0},
+					Status:          0,
+					ActualLength:    uint32(len(respData)),
+					StartFrame:      0,
+					NumberOfPackets: 0,
+					ErrorCount:      0,
+				}
+				if err := ret.Write(&frame); err != nil {
+					s.logger.Error("build async RET_SUBMIT", "seq", job.seq, "error", err)
+					continue
+				}
+				frame.Write(respData)
+				writeMu.Lock()
+				_, werr := writer.Write(frame.Bytes())
+				if werr == nil && bw != nil {
+					werr = bw.Flush()
+				}
+				writeMu.Unlock()
+				if werr != nil {
+					if isClientDisconnect(werr) {
+						s.logger.Debug("URB completion after disconnect", "seq", job.seq, "error", werr)
+					} else {
+						s.logger.Error("write async RET_SUBMIT", "seq", job.seq, "error", werr)
+					}
+				}
+			}
+		}()
+		return jobs
+	}
 
 	var outPayloadScratch []byte
 
@@ -737,63 +829,19 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
 		}
 
 		if dir == usbip.DirIn && ep != 0 {
-			// Data-driven interrupt-IN: complete asynchronously when the
-			// device produces FRESH input. The device blocks on its input
-			// channel up to the endpoint's bInterval; on deadline we replay
-			// the last payload for this endpoint (host keepalive).
+			// Data-driven interrupt-IN: hand the URB to the endpoint's
+			// persistent worker, which completes it when the device produces
+			// FRESH input (or replays the last payload on bInterval expiry).
 			urbCtx, urbCancel := context.WithCancel(ctx)
 			pendingMu.Lock()
 			pending[seq] = urbCancel
 			pendingMu.Unlock()
-			interval := endpointInterval(dev.GetDescriptor(), ep)
-
-			go func(seq, ep, dir uint32) {
-				defer urbCancel()
-				var respData []byte
-				for {
-					attemptCtx, attemptCancel := urbCtx, context.CancelFunc(func() {})
-					if interval > 0 {
-						attemptCtx, attemptCancel = context.WithTimeout(urbCtx, interval)
-					}
-					respData = s.processSubmit(attemptCtx, dev, ep, dir, nil, nil)
-					expired := respData == nil && errors.Is(attemptCtx.Err(), context.DeadlineExceeded)
-					attemptCancel()
-
-					if urbCtx.Err() != nil {
-						return
-					}
-					if respData != nil {
-						respMu.Lock()
-						lastInResp[ep] = append([]byte(nil), respData...)
-						respMu.Unlock()
-						break
-					}
-					if expired {
-						respMu.Lock()
-						cached, ok := lastInResp[ep]
-						respMu.Unlock()
-						if ok {
-							respData = cached
-							break
-						}
-						continue
-					}
-					// Device answered "no data" without blocking.
-					break
-				}
-
-				pendingMu.Lock()
-				delete(pending, seq)
-				pendingMu.Unlock()
-
-				if err := writeRet(seq, 0, uint32(len(respData)), respData, true); err != nil {
-					if isClientDisconnect(err) {
-						s.logger.Debug("URB completion after disconnect", "seq", seq, "error", err)
-					} else {
-						s.logger.Error("write async RET_SUBMIT", "seq", seq, "error", err)
-					}
-				}
-			}(seq, ep, dir)
+			jobs := inWorkers[ep]
+			if jobs == nil {
+				jobs = startInWorker(ep)
+				inWorkers[ep] = jobs
+			}
+			jobs <- inJob{seq: seq, ctx: urbCtx, cancel: urbCancel}
 			continue
 		}
 
