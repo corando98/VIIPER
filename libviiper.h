@@ -21,6 +21,12 @@ extern const char *_GoStringPtr(_GoString_ s);
 /* Start of preamble from import "C" comments.  */
 
 
+#line 3 "fastpath.go"
+
+#include <stdint.h>
+
+#line 1 "cgo-generated-wrapper"
+
 #line 10 "main.go"
 
 #include <stdint.h>
@@ -95,6 +101,8 @@ typedef struct { void *data; GoInt len; GoInt cap; } GoSlice;
 extern "C" {
 #endif
 
+extern int viiper_device_open_x360(uint32_t busID, uint32_t deviceID, uint32_t* outHandle);
+extern int viiper_device_set_input_x360(uint32_t handle, uint32_t buttons, uint8_t lt, uint8_t rt, int16_t lx, int16_t ly, int16_t rx, int16_t ry);
 extern void viiper_free_string(char* s);
 extern char* viiper_last_error(void);
 extern int viiper_init(char* listenAddr);

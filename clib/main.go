@@ -295,6 +295,7 @@ func viiper_shutdown() {
 	// Clear device tracking.
 	devices = make(map[deviceKey]*deviceInfo)
 	feedbackCallbacks = make(map[deviceKey]*feedbackReg)
+	clearX360Handles()
 }
 
 // ---------------------------------------------------------------------------

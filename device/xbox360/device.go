@@ -14,9 +14,13 @@ import (
 )
 
 type Xbox360 struct {
-	gate       *device.InputGate
-	tick       uint64
-	inputState *InputState
+	gate *device.InputGate
+	tick uint64
+	// inputState is stored by value: taking its address (the previous
+	// *InputState field) forced a heap allocation on every UpdateInputState
+	// call, which at 1000 Hz input rates is measurable GC pressure. The zero
+	// value is a valid neutral report.
+	inputState InputState
 	stateMu    sync.Mutex
 	rumbleFunc func(XRumbleState)
 	descriptor usb.Descriptor
@@ -65,8 +69,8 @@ func (x *Xbox360) SetRumbleCallback(f func(XRumbleState)) {
 // UpdateInputState updates the device's current input state (thread-safe).
 func (x *Xbox360) UpdateInputState(state InputState) {
 	x.stateMu.Lock()
-	defer x.stateMu.Unlock()
-	x.inputState = &state
+	x.inputState = state
+	x.stateMu.Unlock()
 	x.gate.Signal()
 }
 
@@ -81,13 +85,16 @@ func (x *Xbox360) HandleTransfer(ctx context.Context, ep uint32, dir uint32, out
 			atomic.AddUint64(&x.tick, 1)
 
 			x.stateMu.Lock()
-			var st InputState
-			if x.inputState != nil {
-				st = *x.inputState
-			}
+			st := x.inputState
 			x.stateMu.Unlock()
 			return st.BuildReport()
 		default:
+			// Secondary IN endpoints (0x82 plugin module, 0x83/0x84 unused):
+			// never any data. Block until the URB is cancelled or its poll
+			// deadline fires — completing immediately with no data makes the
+			// host resubmit in a tight loop through the whole USBIP stack
+			// (the other ported devices use BlockUntilDeadline the same way).
+			device.BlockUntilDeadline(ctx)
 			return nil
 		}
 	}
