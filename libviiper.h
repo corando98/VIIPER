@@ -103,6 +103,8 @@ extern "C" {
 
 extern int viiper_device_open_x360(uint32_t busID, uint32_t deviceID, uint32_t* outHandle);
 extern int viiper_device_set_input_x360(uint32_t handle, uint32_t buttons, uint8_t lt, uint8_t rt, int16_t lx, int16_t ly, int16_t rx, int16_t ry);
+extern int viiper_device_open_ds4(uint32_t busID, uint32_t deviceID, uint32_t* outHandle);
+extern int viiper_device_set_input_ds4(uint32_t handle, uint8_t* data, int length);
 extern void viiper_free_string(char* s);
 extern char* viiper_last_error(void);
 extern int viiper_init(char* listenAddr);

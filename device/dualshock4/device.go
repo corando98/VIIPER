@@ -16,7 +16,9 @@ import (
 
 type DualShock4 struct {
 	gate *device.InputGate
-	inputState *InputState
+	// inputState is stored by value: retaining the caller's *InputState forced
+	// a heap allocation per UpdateInputState call at input rate.
+	inputState InputState
 	stateMu    sync.Mutex
 	timeMu     sync.Mutex
 	outputFunc func(OutputState)
@@ -48,7 +50,7 @@ func New(o *device.CreateOptions) (*DualShock4, error) {
 		}
 	}
 
-	d.inputState = &InputState{
+	d.inputState = InputState{
 		LX:           0,
 		LY:           0,
 		RX:           0,
@@ -108,8 +110,8 @@ func (d *DualShock4) SetOutputCallback(f func(OutputState)) {
 
 func (d *DualShock4) UpdateInputState(state *InputState) {
 	d.stateMu.Lock()
-	defer d.stateMu.Unlock()
-	d.inputState = state
+	d.inputState = *state
+	d.stateMu.Unlock()
 	d.gate.Signal()
 }
 
@@ -121,7 +123,7 @@ func (d *DualShock4) HandleTransfer(ctx context.Context, ep uint32, dir uint32, 
 				return nil
 			}
 			d.stateMu.Lock()
-			st := *d.inputState
+			st := d.inputState
 			d.stateMu.Unlock()
 			return d.buildUSBInputReport(st)
 		default:
@@ -167,7 +169,7 @@ func (d *DualShock4) HandleControl(bmRequestType, bRequest uint8, wValue, _ /* w
 	if bmRequestType == 0xA1 && bRequest == hidGetReport {
 		if reportType == reportTypeInput && reportID == ReportIDInput {
 			d.stateMu.Lock()
-			st := *d.inputState
+			st := d.inputState
 			d.stateMu.Unlock()
 			report := d.buildUSBInputReport(st)
 			if wLength > 0 && int(wLength) < len(report) {

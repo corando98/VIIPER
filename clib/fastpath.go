@@ -8,7 +8,9 @@ import "C"
 import (
 	"fmt"
 	"sync/atomic"
+	"unsafe"
 
+	"github.com/Alia5/VIIPER/device/dualshock4"
 	"github.com/Alia5/VIIPER/device/xbox360"
 )
 
@@ -26,12 +28,16 @@ import (
 // removed device is safe but the reports go nowhere. viiper_shutdown clears
 // the table; handles must be re-opened after re-init.
 
-var x360Handles atomic.Pointer[[]*xbox360.Xbox360]
+var (
+	x360Handles atomic.Pointer[[]*xbox360.Xbox360]
+	ds4Handles  atomic.Pointer[[]*dualshock4.DualShock4]
+)
 
-// clearX360Handles drops all fast-path handles. Called from viiper_shutdown
-// with the global mu held.
+// clearX360Handles drops all fast-path handles (all device types). Called
+// from viiper_shutdown with the global mu held.
 func clearX360Handles() {
 	x360Handles.Store(nil)
+	ds4Handles.Store(nil)
 }
 
 //export viiper_device_open_x360
@@ -84,5 +90,57 @@ func viiper_device_set_input_x360(handle C.uint32_t, buttons C.uint32_t, lt C.ui
 		RX:      int16(rx),
 		RY:      int16(ry),
 	})
+	return 0
+}
+
+//export viiper_device_open_ds4
+func viiper_device_open_ds4(busID C.uint32_t, deviceID C.uint32_t, outHandle *C.uint32_t) C.int {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if server == nil {
+		return setError(fmt.Errorf("not initialized"))
+	}
+
+	info, ok := devices[deviceKey{busID: uint32(busID), devID: uint32(deviceID)}]
+	if !ok {
+		return setError(fmt.Errorf("device %d-%d not found", busID, deviceID))
+	}
+	ds4, ok := info.dev.(*dualshock4.DualShock4)
+	if !ok {
+		return setError(fmt.Errorf("device %d-%d is %q, not dualshock4", busID, deviceID, info.typeName))
+	}
+
+	var s []*dualshock4.DualShock4
+	if old := ds4Handles.Load(); old != nil {
+		s = append(s, *old...)
+	}
+	s = append(s, ds4)
+	ds4Handles.Store(&s)
+
+	if outHandle != nil {
+		*outHandle = C.uint32_t(len(s))
+	}
+	return 0
+}
+
+// viiper_device_set_input_ds4 is the ds4 hot path: same 31-byte wire format
+// as the generic call, but no global mutex, no map lookup, and a zero-copy
+// view of the caller's buffer (parsed before return, never retained). Like
+// the x360 fast path it never touches lastError; returns -1 on an invalid
+// handle, -2 on a malformed buffer.
+//
+//export viiper_device_set_input_ds4
+func viiper_device_set_input_ds4(handle C.uint32_t, data *C.uint8_t, length C.int) C.int {
+	s := ds4Handles.Load()
+	if s == nil || handle == 0 || int(handle) > len(*s) {
+		return -1
+	}
+	buf := unsafe.Slice((*byte)(unsafe.Pointer(data)), int(length))
+	var state dualshock4.InputState
+	if err := state.UnmarshalBinary(buf); err != nil {
+		return -2
+	}
+	(*s)[handle-1].UpdateInputState(&state)
 	return 0
 }
