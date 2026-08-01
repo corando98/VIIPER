@@ -417,6 +417,9 @@ func clampI16(v float64) int16 {
 	return int16(v)
 }
 
+// NaksWhenIdle reports that real Elite Series 2 pads are event-driven.
+func (x *XboxElite2) NaksWhenIdle() bool { return true }
+
 func (x *XboxElite2) GetDescriptor() *usb.Descriptor {
 	return &x.descriptor
 }

@@ -232,6 +232,10 @@ func MakeDescriptor() usb.Descriptor {
 	}
 }
 
+// NaksWhenIdle reports that real wired Xbox 360 pads send input reports
+// only on state change and NAK the interrupt endpoint otherwise.
+func (x *Xbox360) NaksWhenIdle() bool { return true }
+
 func (x *Xbox360) GetDescriptor() *usb.Descriptor {
 	return &x.descriptor
 }

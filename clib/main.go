@@ -269,6 +269,22 @@ func maybeStopCPUProfile() {
 	cpuProfileFile = nil
 }
 
+// idleModeFromEnv resolves the idle-endpoint mode: VIIPER_IDLE_MODE
+// (auto|nak|keepalive) wins; the older VIIPER_NAK_IDLE=1/0 is honored for
+// compatibility; default is "auto" (per-device).
+func idleModeFromEnv() string {
+	if m := os.Getenv("VIIPER_IDLE_MODE"); m != "" {
+		return m
+	}
+	switch os.Getenv("VIIPER_NAK_IDLE") {
+	case "1":
+		return "nak"
+	case "0":
+		return "keepalive"
+	}
+	return "auto"
+}
+
 //export viiper_init
 func viiper_init(listenAddr *C.char) C.int {
 	mu.Lock()
@@ -312,7 +328,7 @@ func viiper_init(listenAddr *C.char) C.int {
 		// Default ON (matches real-hardware poll pacing; confirmed cheaper in
 		// EmulationBench). VIIPER_HW_PACED=0 restores data-driven completion.
 		HardwarePacedCompletions: os.Getenv("VIIPER_HW_PACED") != "0",
-		NakWhenIdle:              os.Getenv("VIIPER_NAK_IDLE") == "1",
+		IdleMode:                 idleModeFromEnv(),
 	}
 
 	server = usbsrv.New(cfg, logger, nil)

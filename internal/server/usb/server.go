@@ -663,9 +663,20 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
 		interval := endpointInterval(dev.GetDescriptor(), ep)
 		hwPaced := s.config.HardwarePacedCompletions && interval > 0
 		// NAK-idle: no per-attempt deadline — the device blocks on its gate
-		// until real input (the pacer above still enforces bInterval spacing),
-		// so nothing is replayed and idle endpoints stay dormant.
-		nakIdle := s.config.NakWhenIdle
+		// until real input (the pacer still enforces bInterval spacing), so
+		// nothing is replayed and idle endpoints stay dormant. In "auto" the
+		// device declares its real hardware's behavior via NaksWhenIdle().
+		nakIdle := false
+		switch s.config.IdleMode {
+		case "nak":
+			nakIdle = true
+		case "keepalive":
+			nakIdle = false
+		default: // "auto" or unset
+			if nb, ok := dev.(interface{ NaksWhenIdle() bool }); ok {
+				nakIdle = nb.NaksWhenIdle()
+			}
+		}
 		go func() {
 			var frame bytes.Buffer
 			var last []byte

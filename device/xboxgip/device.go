@@ -776,6 +776,9 @@ func (d *XboxGIP) HandleControl(bmRequestType, bRequest uint8, wValue, wIndex, w
 	return nil, false
 }
 
+// NaksWhenIdle reports that GIP input is event-driven on real hardware.
+func (d *XboxGIP) NaksWhenIdle() bool { return true }
+
 func (d *XboxGIP) GetDescriptor() *usb.Descriptor {
 	return &d.descriptor
 }
