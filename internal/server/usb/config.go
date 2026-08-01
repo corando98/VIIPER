@@ -14,4 +14,10 @@ type ServerConfig struct {
 	// input rates above the poll rate this proportionally cuts TCP round
 	// trips and kernel URB work; below the poll rate behavior is unchanged.
 	HardwarePacedCompletions bool `help:"Pace interrupt-IN completions to the endpoint bInterval instead of per input update" default:"true" env:"VIIPER_HW_PACED"`
+	// NakWhenIdle leaves interrupt-IN URBs pending until fresh input arrives
+	// instead of replaying the last report at every bInterval (keepalive).
+	// Real HID/XUSB hardware NAKs the endpoint when state is unchanged, so
+	// this is the hardware-faithful mode: completions = min(input rate, poll
+	// rate) and an idle device generates zero traffic and zero timer churn.
+	NakWhenIdle bool `help:"NAK idle interrupt-IN endpoints instead of replaying keepalive reports" default:"false" env:"VIIPER_NAK_IDLE"`
 }

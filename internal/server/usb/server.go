@@ -662,6 +662,10 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
 		jobs := make(chan inJob, 8)
 		interval := endpointInterval(dev.GetDescriptor(), ep)
 		hwPaced := s.config.HardwarePacedCompletions && interval > 0
+		// NAK-idle: no per-attempt deadline — the device blocks on its gate
+		// until real input (the pacer above still enforces bInterval spacing),
+		// so nothing is replayed and idle endpoints stay dormant.
+		nakIdle := s.config.NakWhenIdle
 		go func() {
 			var frame bytes.Buffer
 			var last []byte
@@ -701,7 +705,7 @@ func (s *Server) handleUrbStream(conn net.Conn, dev usb.Device) error {
 				var respData []byte
 				for {
 					attemptCtx, attemptCancel := job.ctx, context.CancelFunc(func() {})
-					if interval > 0 {
+					if !nakIdle && interval > 0 {
 						attemptCtx, attemptCancel = context.WithTimeout(job.ctx, interval)
 					}
 					respData = s.processSubmit(attemptCtx, dev, ep, usbip.DirIn, nil, nil)
