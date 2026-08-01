@@ -312,6 +312,7 @@ func viiper_init(listenAddr *C.char) C.int {
 		// Default ON (matches real-hardware poll pacing; confirmed cheaper in
 		// EmulationBench). VIIPER_HW_PACED=0 restores data-driven completion.
 		HardwarePacedCompletions: os.Getenv("VIIPER_HW_PACED") != "0",
+		NakWhenIdle:              os.Getenv("VIIPER_NAK_IDLE") == "1",
 	}
 
 	server = usbsrv.New(cfg, logger, nil)
