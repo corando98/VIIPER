@@ -14,7 +14,9 @@ import (
 
 type DualSenseEdge struct {
 	gate *device.InputGate
-	inputState *InputState
+	// inputState is stored by value: retaining a caller pointer forced a
+	// heap allocation per UpdateInputState call at input rate.
+	inputState InputState
 	stateMu    sync.Mutex
 	outputFunc func(OutputState)
 	descriptor usb.Descriptor
@@ -41,7 +43,7 @@ func New(o *device.CreateOptions) (*DualSenseEdge, error) {
 		}
 	}
 
-	d.inputState = &InputState{
+	d.inputState = InputState{
 		AccelX: DefaultAccelXRaw,
 		AccelY: DefaultAccelYRaw,
 		AccelZ: DefaultAccelZRaw,
@@ -56,8 +58,12 @@ func (d *DualSenseEdge) SetOutputCallback(f func(OutputState)) {
 
 func (d *DualSenseEdge) UpdateInputState(state *InputState) {
 	d.stateMu.Lock()
-	defer d.stateMu.Unlock()
-	d.inputState = state
+	if state == nil {
+		d.inputState = InputState{}
+	} else {
+		d.inputState = *state
+	}
+	d.stateMu.Unlock()
 	d.gate.Signal()
 }
 
@@ -69,7 +75,7 @@ func (d *DualSenseEdge) HandleTransfer(ctx context.Context, ep uint32, dir uint3
 				return nil
 			}
 			d.stateMu.Lock()
-			st := *d.inputState
+			st := d.inputState
 			d.stateMu.Unlock()
 			return d.buildUSBInputReport(st)
 		default:
@@ -138,7 +144,7 @@ func (d *DualSenseEdge) HandleControl(bmRequestType, bRequest uint8, wValue, _ u
 	if bmRequestType == 0xA1 && bRequest == hidGetReport {
 		if reportType == reportTypeInput && reportID == ReportIDInput {
 			d.stateMu.Lock()
-			st := *d.inputState
+			st := d.inputState
 			d.stateMu.Unlock()
 			report := d.buildUSBInputReport(st)
 			if wLength > 0 && int(wLength) < len(report) {

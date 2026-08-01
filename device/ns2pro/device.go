@@ -16,7 +16,9 @@ import (
 type NS2Pro struct {
 	gate           *device.InputGate
 	stateMu    sync.Mutex
-	inputState *InputState
+	// inputState is stored by value: retaining a caller pointer forced a
+	// heap allocation per UpdateInputState call at input rate.
+	inputState InputState
 	outputFunc func(OutputState)
 	descriptor usb.Descriptor
 
@@ -36,7 +38,7 @@ type NS2Pro struct {
 func New(o *device.CreateOptions) (*NS2Pro, error) {
 	d := &NS2Pro{
 		gate: device.NewInputGate(),
-		inputState:     defaultInputState(),
+		inputState:     *defaultInputState(),
 		descriptor:     MakeDescriptor(),
 		activeReportID: ReportIDPro,
 		featureFlags:   FeatureButtons | FeatureSticks,
@@ -60,7 +62,7 @@ func (d *NS2Pro) SetOutputCallback(f func(OutputState)) {
 func (d *NS2Pro) UpdateInputState(state InputState) {
 	d.stateMu.Lock()
 	defer d.stateMu.Unlock()
-	d.inputState = &state
+	d.inputState = state
 	d.gate.Signal()
 }
 
@@ -212,7 +214,7 @@ func (d *NS2Pro) nextInputReport() []byte {
 
 func (d *NS2Pro) inputReportForID(reportID uint8) []byte {
 	d.stateMu.Lock()
-	st := *d.inputState
+	st := d.inputState
 	d.stateMu.Unlock()
 
 	d.protoMu.Lock()

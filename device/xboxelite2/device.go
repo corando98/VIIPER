@@ -17,7 +17,9 @@ import (
 
 type XboxElite2 struct {
 	gate       *device.InputGate
-	inputState *elite2state.InputState
+	// inputState is stored by value: retaining a caller pointer forced a
+	// heap allocation per UpdateInputState call at input rate.
+	inputState elite2state.InputState
 	stateMu    sync.Mutex
 	outputFunc func(elite2state.OutputState)
 	descriptor usb.Descriptor
@@ -209,8 +211,12 @@ func (x *XboxElite2) SetOutputCallback(f func(elite2state.OutputState)) {
 
 func (x *XboxElite2) UpdateInputState(state *elite2state.InputState) {
 	x.stateMu.Lock()
-	defer x.stateMu.Unlock()
-	x.inputState = state
+	if state == nil {
+		x.inputState = elite2state.InputState{}
+	} else {
+		x.inputState = *state
+	}
+	x.stateMu.Unlock()
 	x.gate.Signal()
 }
 
@@ -222,10 +228,7 @@ func (x *XboxElite2) HandleTransfer(ctx context.Context, ep uint32, dir uint32, 
 				return nil
 			}
 			x.stateMu.Lock()
-			var st elite2state.InputState
-			if x.inputState != nil {
-				st = *x.inputState
-			}
+			st := x.inputState
 			x.stateMu.Unlock()
 
 			return x.buildUSBInputReport(st)
@@ -351,10 +354,7 @@ func (x *XboxElite2) HandleControl(bmRequestType, bRequest uint8, wValue, _ uint
 	if bmRequestType == 0xA1 && bRequest == hidGetReport {
 		if reportType == reportTypeInput && reportID == ReportIDInput {
 			x.stateMu.Lock()
-			var st elite2state.InputState
-			if x.inputState != nil {
-				st = *x.inputState
-			}
+			st := x.inputState
 			x.stateMu.Unlock()
 			report := x.buildUSBInputReport(st)
 			if wLength > 0 && int(wLength) < len(report) {

@@ -687,68 +687,76 @@ func viiper_device_set_input(busID C.uint32_t, deviceID C.uint32_t, data *C.uint
 		return setError(fmt.Errorf("device %d-%d not found", busID, deviceID))
 	}
 
-	buf := C.GoBytes(unsafe.Pointer(data), length)
+	// Zero-copy view of the caller's buffer: decoded synchronously under mu
+	// and never retained, so no C.GoBytes heap copy is needed.
+	buf := unsafe.Slice((*byte)(unsafe.Pointer(data)), int(length))
+	return setError(applyInput(info, buf))
+}
 
+// applyInput decodes a wire-format input buffer and applies it to the
+// device. Shared by the generic (mutex-guarded) set_input entry point and
+// the lock-free handle-based fast path. buf is not retained.
+func applyInput(info *deviceInfo, buf []byte) error {
 	switch info.typeName {
 	case "xbox360":
 		xdev, ok := info.dev.(*xbox360.Xbox360)
 		if !ok {
-			return setError(fmt.Errorf("device type mismatch"))
+			return fmt.Errorf("device type mismatch")
 		}
 		var state xbox360.InputState
 		if err := state.UnmarshalBinary(buf); err != nil {
-			return setError(err)
+			return err
 		}
 		xdev.UpdateInputState(state)
 
 	case "dualshock4":
 		ds4, ok := info.dev.(*dualshock4.DualShock4)
 		if !ok {
-			return setError(fmt.Errorf("device type mismatch"))
+			return fmt.Errorf("device type mismatch")
 		}
 		var state dualshock4.InputState
 		if err := state.UnmarshalBinary(buf); err != nil {
-			return setError(err)
+			return err
 		}
 		ds4.UpdateInputState(&state)
 
 	case "dualsenseedge":
 		dse, ok := info.dev.(*dualsenseedge.DualSenseEdge)
 		if !ok {
-			return setError(fmt.Errorf("device type mismatch"))
+			return fmt.Errorf("device type mismatch")
 		}
 		var state dualsenseedge.InputState
 		if err := state.UnmarshalBinary(buf); err != nil {
-			return setError(err)
+			return err
 		}
 		dse.UpdateInputState(&state)
 
 	case "dualsense":
 		ds, ok := info.dev.(*dualsense.DualSense)
 		if !ok {
-			return setError(fmt.Errorf("device type mismatch"))
+			return fmt.Errorf("device type mismatch")
 		}
 		var state dualsense.InputState
 		if err := state.UnmarshalBinary(buf); err != nil {
-			return setError(err)
+			return err
 		}
 		ds.UpdateInputState(&state)
 
 	case "steamdeck":
 		sd, ok := info.dev.(*steamdeck.SteamDeck)
 		if !ok {
-			return setError(fmt.Errorf("device type mismatch"))
+			return fmt.Errorf("device type mismatch")
 		}
 		var state steamdeck.InputState
 		if err := state.UnmarshalBinary(buf); err != nil {
-			return setError(err)
+			return err
 		}
 		sd.UpdateInputState(&state)
 
 	case "xboxelite2":
 		xe2, ok := info.dev.(*xboxelite2.XboxElite2)
 		if !ok {
-			return setError(fmt.Errorf("device type mismatch"))
+			return fmt.Errorf("device type mismatch")
 		}
 		var state elite2state.InputState
 		var err error
@@ -766,41 +774,41 @@ func viiper_device_set_input(busID C.uint32_t, deviceID C.uint32_t, data *C.uint
 			)
 		}
 		if err != nil {
-			return setError(err)
+			return err
 		}
 		xe2.UpdateInputState(&state)
 
 	case "steamcontroller":
 		sc, ok := info.dev.(*steamcontroller.SteamController)
 		if !ok {
-			return setError(fmt.Errorf("device type mismatch"))
+			return fmt.Errorf("device type mismatch")
 		}
 		// Gordon uses its native 64-byte input format.
 		var state steamcontroller.InputState
 		if err := state.UnmarshalBinary(buf); err != nil {
-			return setError(err)
+			return err
 		}
 		sc.UpdateInputState(&state)
 
 	case "switchpro":
 		sp, ok := info.dev.(*switchpro.SwitchPro)
 		if !ok {
-			return setError(fmt.Errorf("device type mismatch"))
+			return fmt.Errorf("device type mismatch")
 		}
 		var state switchpro.InputState
 		if err := state.UnmarshalBinary(buf); err != nil {
-			return setError(err)
+			return err
 		}
 		sp.UpdateInputState(&state)
 
 	case "xboxgip":
 		xdev, ok := info.dev.(*xboxgip.XboxGIP)
 		if !ok {
-			return setError(fmt.Errorf("device type mismatch"))
+			return fmt.Errorf("device type mismatch")
 		}
 		var state xboxgip.InputState
 		if err := state.UnmarshalBinary(buf); err != nil {
-			return setError(err)
+			return err
 		}
 		xdev.UpdateInputState(&state)
 
@@ -811,20 +819,21 @@ func viiper_device_set_input(busID C.uint32_t, deviceID C.uint32_t, data *C.uint
 		// (not pointer) to match the port's API.
 		ns2, ok := info.dev.(*ns2pro.NS2Pro)
 		if !ok {
-			return setError(fmt.Errorf("device type mismatch"))
+			return fmt.Errorf("device type mismatch")
 		}
 		var state ns2pro.InputState
 		if err := state.UnmarshalBinary(buf); err != nil {
-			return setError(err)
+			return err
 		}
 		ns2.UpdateInputState(state)
 
 	default:
-		return setError(fmt.Errorf("input not supported for device type: %s", info.typeName))
+		return fmt.Errorf("input not supported for device type: %s", info.typeName)
 	}
 
-	return 0
+	return nil
 }
+
 
 // ---------------------------------------------------------------------------
 // Feedback callbacks

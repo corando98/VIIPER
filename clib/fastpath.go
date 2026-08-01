@@ -31,6 +31,7 @@ import (
 var (
 	x360Handles atomic.Pointer[[]*xbox360.Xbox360]
 	ds4Handles  atomic.Pointer[[]*dualshock4.DualShock4]
+	fastHandles atomic.Pointer[[]*deviceInfo]
 )
 
 // clearX360Handles drops all fast-path handles (all device types). Called
@@ -38,6 +39,58 @@ var (
 func clearX360Handles() {
 	x360Handles.Store(nil)
 	ds4Handles.Store(nil)
+	fastHandles.Store(nil)
+}
+
+// viiper_device_open_fast resolves any device into a fast-path handle for
+// viiper_device_set_input_fast. Unlike the typed x360/ds4 variants it works
+// for every device type: the submit call takes the same wire format as the
+// generic viiper_device_set_input, but skips the global mutex, map lookup
+// and buffer copy. Same lifetime rules as the typed handles.
+//
+//export viiper_device_open_fast
+func viiper_device_open_fast(busID C.uint32_t, deviceID C.uint32_t, outHandle *C.uint32_t) C.int {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if server == nil {
+		return setError(fmt.Errorf("not initialized"))
+	}
+
+	info, ok := devices[deviceKey{busID: uint32(busID), devID: uint32(deviceID)}]
+	if !ok {
+		return setError(fmt.Errorf("device %d-%d not found", busID, deviceID))
+	}
+
+	var s []*deviceInfo
+	if old := fastHandles.Load(); old != nil {
+		s = append(s, *old...)
+	}
+	s = append(s, info)
+	fastHandles.Store(&s)
+
+	if outHandle != nil {
+		*outHandle = C.uint32_t(len(s))
+	}
+	return 0
+}
+
+// viiper_device_set_input_fast is the type-agnostic hot path: a zero-copy
+// view of the caller's buffer is decoded via the same dispatch as the
+// generic call. Never touches lastError; returns -1 for an invalid handle,
+// -2 for a decode/apply error.
+//
+//export viiper_device_set_input_fast
+func viiper_device_set_input_fast(handle C.uint32_t, data *C.uint8_t, length C.int) C.int {
+	s := fastHandles.Load()
+	if s == nil || handle == 0 || int(handle) > len(*s) {
+		return -1
+	}
+	buf := unsafe.Slice((*byte)(unsafe.Pointer(data)), int(length))
+	if err := applyInput((*s)[handle-1], buf); err != nil {
+		return -2
+	}
+	return 0
 }
 
 //export viiper_device_open_x360

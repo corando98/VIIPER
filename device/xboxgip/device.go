@@ -20,7 +20,9 @@ import (
 
 // XboxGIP implements a GIP (Game Input Protocol) Xbox Series X|S controller.
 type XboxGIP struct {
-	inputState *InputState
+	// inputState is stored by value: retaining a caller pointer forced a
+	// heap allocation per UpdateInputState call at input rate.
+	inputState InputState
 	stateMu    sync.Mutex
 	outputFunc func(OutputState)
 	descriptor usb.Descriptor
@@ -200,8 +202,12 @@ func (d *XboxGIP) SetOutputCallback(f func(OutputState)) {
 // UpdateInputState updates the current controller state (thread-safe).
 func (d *XboxGIP) UpdateInputState(state *InputState) {
 	d.stateMu.Lock()
-	defer d.stateMu.Unlock()
-	d.inputState = state
+	if state == nil {
+		d.inputState = InputState{}
+	} else {
+		d.inputState = *state
+	}
+	d.stateMu.Unlock()
 }
 
 // HandleTransfer implements the GIP protocol over interrupt IN/OUT endpoints.
@@ -365,10 +371,7 @@ func (d *XboxGIP) handleEPIn() []byte {
 	// would be wasted.
 	if state == stateActive {
 		d.stateMu.Lock()
-		var pre InputState
-		if d.inputState != nil {
-			pre = *d.inputState
-		}
+		pre := d.inputState
 		d.stateMu.Unlock()
 		guideDown := (pre.Buttons & xinputGuide) != 0
 		newVal := int32(0)
@@ -407,10 +410,7 @@ func (d *XboxGIP) handleEPIn() []byte {
 	case stateActive:
 		// Send current input report.
 		d.stateMu.Lock()
-		var st InputState
-		if d.inputState != nil {
-			st = *d.inputState
-		}
+		st := d.inputState
 		d.stateMu.Unlock()
 
 		// Elite 2 wired (PID 0x0B00) → 46-byte firmware-5.x layout with

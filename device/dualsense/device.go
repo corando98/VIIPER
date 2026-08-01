@@ -16,7 +16,9 @@ import (
 
 type DualSense struct {
 	gate *device.InputGate
-	inputState *InputState
+	// inputState is stored by value: retaining a caller pointer forced a
+	// heap allocation per UpdateInputState call at input rate.
+	inputState InputState
 	stateMu    sync.Mutex
 	timeMu     sync.Mutex
 	outputFunc func(OutputState)
@@ -35,7 +37,6 @@ func New(o *device.CreateOptions) (*DualSense, error) {
 		gate: device.NewInputGate(),
 		descriptor: defaultDescriptor,
 		now:        time.Now,
-		inputState: &InputState{},
 	}
 	if o != nil {
 		if o.IdVendor != nil {
@@ -54,13 +55,12 @@ func (d *DualSense) SetOutputCallback(f func(OutputState)) {
 
 func (d *DualSense) UpdateInputState(state *InputState) {
 	d.stateMu.Lock()
-	defer d.stateMu.Unlock()
 	if state == nil {
-		d.inputState = &InputState{}
-		d.gate.Signal()
-		return
+		d.inputState = InputState{}
+	} else {
+		d.inputState = *state
 	}
-	d.inputState = state
+	d.stateMu.Unlock()
 	d.gate.Signal()
 }
 
@@ -72,7 +72,7 @@ func (d *DualSense) HandleTransfer(ctx context.Context, ep uint32, dir uint32, o
 				return nil
 			}
 			d.stateMu.Lock()
-			st := *d.inputState
+			st := d.inputState
 			d.stateMu.Unlock()
 			return d.buildUSBInputReport(st)
 		default:
@@ -103,7 +103,7 @@ func (d *DualSense) HandleControl(bmRequestType, bRequest uint8, wValue, _ uint1
 	if bmRequestType == 0xA1 && bRequest == hidGetReport {
 		if reportType == reportTypeInput && reportID == ReportIDInput {
 			d.stateMu.Lock()
-			st := *d.inputState
+			st := d.inputState
 			d.stateMu.Unlock()
 			report := d.buildUSBInputReport(st)
 			if wLength > 0 && int(wLength) < len(report) {
