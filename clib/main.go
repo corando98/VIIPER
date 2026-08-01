@@ -27,7 +27,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/pprof"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -281,6 +283,17 @@ func viiper_init(listenAddr *C.char) C.int {
 		addr = "0.0.0.0:3241"
 	}
 
+	// The embedded server runs a handful of goroutines; on big machines the
+	// default GOMAXPROCS=NumCPU only adds scheduler and netpoller overhead.
+	// VIIPER_GOMAXPROCS overrides; GOGC/GOMEMLIMIT work as usual via env.
+	if v := os.Getenv("VIIPER_GOMAXPROCS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			runtime.GOMAXPROCS(n)
+		}
+	} else if runtime.NumCPU() > 4 {
+		runtime.GOMAXPROCS(4)
+	}
+
 	// Set up file-based logging next to the DLL for protocol debugging.
 	if exe, err := os.Executable(); err == nil {
 		logPath := filepath.Join(filepath.Dir(exe), "viiper_go_debug.log")
@@ -296,8 +309,9 @@ func viiper_init(listenAddr *C.char) C.int {
 		ConnectionTimeout:       30 * time.Second,
 		BusCleanupTimeout:       5 * time.Second,
 		WriteBatchFlushInterval: 0, // immediate writes — data-driven completion makes batching counterproductive
-		// Opt-in via env for now; flip the default if benchmarks confirm.
-		HardwarePacedCompletions: os.Getenv("VIIPER_HW_PACED") == "1",
+		// Default ON (matches real-hardware poll pacing; confirmed cheaper in
+		// EmulationBench). VIIPER_HW_PACED=0 restores data-driven completion.
+		HardwarePacedCompletions: os.Getenv("VIIPER_HW_PACED") != "0",
 	}
 
 	server = usbsrv.New(cfg, logger, nil)
